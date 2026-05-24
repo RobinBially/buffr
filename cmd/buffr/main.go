@@ -52,14 +52,16 @@ func main() {
 		}
 	}
 
+	// Multi-instance mode: BUFFR_TARGETS or BUFFR_0_TARGET take precedence
+	// over any subcommand — check before the args-empty guard so containers
+	// using only BUFFR_TARGETS don't need BUFFR_MODE.
+	if instances := loadInstances(); len(instances) > 0 {
+		os.Exit(runInstances(instances))
+	}
+
 	if len(args) == 0 {
 		usage()
 		os.Exit(2)
-	}
-	// Multi-instance mode: BUFFR_0_TARGET (and optionally BUFFR_1_TARGET, …)
-	// takes precedence over any subcommand.
-	if instances := loadInstances(); len(instances) > 0 {
-		os.Exit(runInstances(instances))
 	}
 
 	switch args[0] {
