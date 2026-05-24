@@ -1,91 +1,81 @@
 # buffr
 
-Record HTTP, SSE and WebSocket traffic once, replay it deterministically in tests.
+**Record API traffic once. Replay it forever.**
 
-`buffr` sits between a client and an upstream API. In `record` mode it
-passes traffic through and saves every interaction to a JSON cassette. In
-`replay` mode it serves those cassettes locally — same request shape in,
-identical response out, including server-sent-event chunk timing and
-bidirectional WebSocket frame ordering.
+`buffr` is a transparent proxy that sits between your app and any HTTP/WebSocket API. First run captures every interaction to a JSON cassette. Every run after that serves it locally — no network, no API keys, no flakiness.
 
-The original use case is testing LLM-driven code against real provider
-responses (OpenAI chat completions over SSE, OpenAI Realtime over WebSocket)
-without an LLM in the loop on every test run.
+```
+your app → buffr → api.openai.com   (first run: records)
+your app → buffr                    (every run after: replays)
+```
 
-## Status
+## Modes
 
-MVP. Supports:
+| Mode | What it does |
+|------|-------------|
+| `auto` | Record-on-miss — replays known requests, records new ones |
+| `record` | Forward everything and write to cassette |
+| `replay` | Serve from cassette only, no network |
 
-- HTTP requests + responses
-- Server-sent events (text/event-stream) — chunked replay with original timing
-- WebSocket — bidirectional frame capture, drift detection on client-to-server frames
-
-Out of scope (intentionally):
-
-- TLS termination at the proxy (clients point at `http://` / `ws://`; the proxy
-  handles upstream TLS itself).
-- Request matching on non-deterministic bodies without a normalizer.
-- Multi-cassette routing per port.
-
-## Usage
+## Quickstart
 
 ```sh
-# Record
-buffr record --target https://api.openai.com --port 8080 --cassette session.json
-
-# Replay
-buffr replay --cassette session.json --port 8080
+# One command. Cassette is auto-named after the target host.
+buffr auto --target https://api.openai.com --port 8080
 ```
 
-Point your client at `http://localhost:8080`. WebSocket clients use
-`ws://localhost:8080/<original path>`.
+Point your app at `http://localhost:8080` instead of `https://api.openai.com`. Done.
 
-## Cassette format
+## Docker
 
-```json
-{
-  "version": 1,
-  "interactions": [
-    {
-      "type": "http",
-      "request": {
-        "method": "POST",
-        "path": "/v1/chat/completions",
-        "headers": {"content-type": "application/json"},
-        "body": "{...}"
-      },
-      "response": {
-        "status": 200,
-        "headers": {"content-type": "text/event-stream"},
-        "body_chunks": [
-          {"data": "data: {...}\n\n", "delay_ms": 0}
-        ]
-      }
-    },
-    {
-      "type": "websocket",
-      "request": {
-        "path": "/v1/realtime",
-        "query": "model=gpt-4o-realtime-preview",
-        "headers": {"authorization": "<redacted>"}
-      },
-      "frames": [
-        {"direction": "client_to_server", "opcode": "text", "data": "...", "delay_ms": 0},
-        {"direction": "server_to_client", "opcode": "text", "data": "...", "delay_ms": 50}
-      ]
-    }
-  ]
-}
+```sh
+docker run -e BUFFR_MODE=auto \
+           -e BUFFR_TARGET=https://api.openai.com \
+           -v ./cassettes:/data \
+           -p 8080:8080 \
+           ghcr.io/robinbially/buffr:latest
 ```
+
+### Multiple APIs in one container
+
+```sh
+docker run \
+  -e BUFFR_0_TARGET=https://api.openai.com    -e BUFFR_0_PORT=8081 \
+  -e BUFFR_1_TARGET=https://api.anthropic.com -e BUFFR_1_PORT=8082 \
+  -e BUFFR_2_TARGET=https://api.elevenlabs.io -e BUFFR_2_PORT=8083 \
+  -v ./cassettes:/data \
+  -p 8081:8081 -p 8082:8082 -p 8083:8083 \
+  ghcr.io/robinbially/buffr:latest
+```
+
+Each instance gets its own port and cassette (`api.openai.com.json`, …). Add `BUFFR_N_*` groups indefinitely — indices must be contiguous starting at 0.
+
+## Configuration
+
+Every flag has an environment variable equivalent. Flags take precedence.
+
+| Flag | Env | Default |
+|------|-----|---------|
+| `--target` | `BUFFR_TARGET` | — |
+| `--port` | `BUFFR_PORT` | `8080` |
+| `--cassette` | `BUFFR_CASSETTE` | `<target-host>.json` |
+| _(subcommand)_ | `BUFFR_MODE` | — |
+
+## What gets recorded
+
+- **HTTP** — request + response, any method, any path
+- **SSE** (`text/event-stream`) — each chunk with original inter-chunk timing
+- **WebSocket** — bidirectional frames in order, with delays
+
+Cassettes are plain JSON — human-readable, diff-friendly, editable by hand.
 
 ## Development
 
 ```sh
-go build ./...
 go test ./...
-go run ./cmd/buffr replay --cassette examples/hello.json --port 8080
+go run ./cmd/buffr auto --target https://api.openai.com
 ```
 
 ## License
 
-MIT.
+MIT
