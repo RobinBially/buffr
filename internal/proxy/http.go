@@ -1,0 +1,287 @@
+// Package proxy implements the HTTP + WebSocket record/replay handlers.
+package proxy
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"sync"
+	"time"
+
+	"buffr/internal/cassette"
+	"buffr/internal/matcher"
+)
+
+// Recorder is a synchronization wrapper around a Cassette so the HTTP and WS
+// handlers can append interactions concurrently. The cassette is flushed to
+// disk after every append so a crashed test session still leaves a usable
+// (partial) recording behind.
+type Recorder struct {
+	mu       sync.Mutex
+	cassette *cassette.Cassette
+	path     string
+}
+
+func NewRecorder(path string) *Recorder {
+	return &Recorder{
+		cassette: &cassette.Cassette{Version: cassette.CurrentVersion},
+		path:     path,
+	}
+}
+
+// Append adds an interaction and flushes. Errors during flush are returned but
+// not propagated to the HTTP client — the client doesn't care that we failed
+// to persist its traffic.
+func (r *Recorder) Append(it cassette.Interaction) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cassette.Interactions = append(r.cassette.Interactions, it)
+	return cassette.Save(r.path, r.cassette)
+}
+
+// RecordHandler returns an http.Handler that proxies every request to `target`
+// and writes the round-trip to the recorder. It supports `text/event-stream`
+// responses by streaming chunks through and capturing each chunk with the
+// elapsed time since the previous chunk.
+//
+// Hop-by-hop headers are stripped per RFC 7230 §6.1; this also prevents
+// `Host`/`Connection` from leaking the local proxy port back into the
+// recording.
+func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "buffr: failed to read request body: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		r.Body.Close()
+
+		upstream := *target
+		upstream.Path = singleJoin(upstream.Path, r.URL.Path)
+		upstream.RawQuery = r.URL.RawQuery
+
+		upReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstream.String(), bytes.NewReader(body))
+		if err != nil {
+			http.Error(w, "buffr: failed to build upstream request: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		copyHeadersExceptHopByHop(upReq.Header, r.Header)
+
+		resp, err := http.DefaultTransport.RoundTrip(upReq)
+		if err != nil {
+			http.Error(w, "buffr: upstream request failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		recordedResp := cassette.HTTPResponse{
+			Status:  resp.StatusCode,
+			Headers: filterHeaders(resp.Header),
+		}
+
+		isSSE := isEventStream(resp.Header)
+		if isSSE {
+			// Streaming path: write headers + chunks live so the client sees
+			// SSE events in real time, capturing inter-chunk delays. Append
+			// happens after the upstream EOF — the connection stays open
+			// until then, so the client's read loop sees the recorded data
+			// before the cassette save races with test continuation.
+			copyHeadersExceptHopByHop(w.Header(), resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			flusher, _ := w.(http.Flusher)
+			buf := make([]byte, 4096)
+			lastChunkAt := time.Now()
+			for {
+				n, readErr := resp.Body.Read(buf)
+				if n > 0 {
+					chunk := append([]byte(nil), buf[:n]...)
+					if _, werr := w.Write(chunk); werr != nil {
+						break
+					}
+					if flusher != nil {
+						flusher.Flush()
+					}
+					now := time.Now()
+					recordedResp.BodyChunks = append(recordedResp.BodyChunks, cassette.Chunk{
+						Data:    string(chunk),
+						DelayMs: int(now.Sub(lastChunkAt) / time.Millisecond),
+					})
+					lastChunkAt = now
+				}
+				if readErr != nil {
+					break
+				}
+			}
+		} else {
+			// Non-streaming path: buffer first, save cassette, THEN write
+			// to client. Otherwise the client's Content-Length-aware reader
+			// could finish before the handler's Append call, racing the
+			// "tests read cassette right after the call" pattern.
+			full, readErr := io.ReadAll(resp.Body)
+			if readErr != nil && readErr != io.EOF {
+				http.Error(w, "buffr: upstream body read failed: "+readErr.Error(), http.StatusBadGateway)
+				return
+			}
+			recordedResp.Body = string(full)
+		}
+
+		if appendErr := rec.Append(cassette.Interaction{
+			Type: "http",
+			HTTP: &cassette.HTTPExchange{
+				Request: cassette.HTTPRequest{
+					Method:  r.Method,
+					Path:    r.URL.Path,
+					Query:   r.URL.RawQuery,
+					Headers: filterHeaders(r.Header),
+					Body:    string(body),
+				},
+				Response: recordedResp,
+			},
+		}); appendErr != nil {
+			// Persistence failure is loud — recording is the whole point of
+			// this handler, and a silent miss makes test debugging miserable.
+			fmt.Fprintf(os.Stderr, "buffr: failed to append to cassette: %v\n", appendErr)
+		}
+
+		if !isSSE {
+			copyHeadersExceptHopByHop(w.Header(), resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write([]byte(recordedResp.Body))
+		}
+	})
+}
+
+// ReplayHandler serves recorded responses. It uses the matcher to find the
+// next exchange for each incoming request and returns 599 with an explanatory
+// body when no recorded response matches — chosen over a generic 500 so test
+// failures point at the proxy rather than the application.
+func ReplayHandler(m *matcher.Matcher) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "buffr: failed to read request body: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		r.Body.Close()
+
+		ex := m.Take(r.Method, r.URL.Path, string(body))
+		if ex == nil {
+			http.Error(w, fmt.Sprintf("buffr: no cassette match for %s %s", r.Method, r.URL.Path), 599)
+			return
+		}
+
+		for k, vs := range ex.Response.Headers {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(ex.Response.Status)
+		flusher, _ := w.(http.Flusher)
+
+		if len(ex.Response.BodyChunks) > 0 {
+			for _, c := range ex.Response.BodyChunks {
+				if c.DelayMs > 0 {
+					time.Sleep(time.Duration(c.DelayMs) * time.Millisecond)
+				}
+				if _, werr := w.Write([]byte(c.Data)); werr != nil {
+					return
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			return
+		}
+		_, _ = w.Write([]byte(ex.Response.Body))
+	})
+}
+
+func isEventStream(h http.Header) bool {
+	ct := h.Get("Content-Type")
+	for _, p := range splitAndTrim(ct, ';') {
+		if p == "text/event-stream" {
+			return true
+		}
+	}
+	return false
+}
+
+func splitAndTrim(s string, sep byte) []string {
+	var out []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == sep {
+			out = append(out, trimSpaces(s[start:i]))
+			start = i + 1
+		}
+	}
+	out = append(out, trimSpaces(s[start:]))
+	return out
+}
+
+func trimSpaces(s string) string {
+	start, end := 0, len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\t') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t') {
+		end--
+	}
+	return s[start:end]
+}
+
+// hopByHop is the canonical list from RFC 7230 §6.1. We also strip Host and
+// Authorization so cassettes don't carry secrets back to disk by default — a
+// real production-grade tool might want a redaction pipeline; for an MVP
+// dropping them is acceptable since matching ignores headers anyway.
+var hopByHop = map[string]struct{}{
+	"Connection":          {},
+	"Keep-Alive":          {},
+	"Proxy-Authenticate":  {},
+	"Proxy-Authorization": {},
+	"Te":                  {},
+	"Trailer":             {},
+	"Transfer-Encoding":   {},
+	"Upgrade":             {},
+}
+
+func copyHeadersExceptHopByHop(dst, src http.Header) {
+	for k, vs := range src {
+		if _, skip := hopByHop[http.CanonicalHeaderKey(k)]; skip {
+			continue
+		}
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
+}
+
+func filterHeaders(src http.Header) map[string][]string {
+	out := make(map[string][]string, len(src))
+	for k, vs := range src {
+		if _, skip := hopByHop[http.CanonicalHeaderKey(k)]; skip {
+			continue
+		}
+		out[k] = append([]string(nil), vs...)
+	}
+	return out
+}
+
+// singleJoin joins two URL paths preserving exactly one '/' between them.
+func singleJoin(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	case a[len(a)-1] == '/' && b[0] == '/':
+		return a + b[1:]
+	case a[len(a)-1] != '/' && b[0] != '/':
+		return a + "/" + b
+	default:
+		return a + b
+	}
+}
