@@ -4,8 +4,9 @@
 
 ### Record API traffic once. Replay it forever.
 
-A transparent proxy for HTTP, SSE and WebSocket APIs.<br />
-First run captures every interaction. Every run after that is instant, free and deterministic.
+A VCR-style record/replay proxy for HTTP, SSE and WebSocket APIs — language-agnostic,<br />
+drop-in for OpenAI, Anthropic or any upstream. First run captures every interaction.<br />
+Every run after that is instant, free and deterministic.
 
 <br />
 
@@ -29,6 +30,14 @@ First run captures every interaction. Every run after that is instant, free and 
 Every test that hits a real API is a gamble. The response changes. The rate limit kicks in. The latency spikes. You pay per token.
 
 buffr removes the API from the equation. Point it at any upstream, run your app once — every call is recorded to a JSON cassette. From then on, tests run against the cassette: zero latency, zero cost, zero flakiness. The app never knows the difference.
+
+## Use cases
+
+- **Test LLM apps without burning tokens** — record one real call to OpenAI, Anthropic, ElevenLabs or any LLM API, then run your test suite a million times for free
+- **Deterministic CI** — kill flakiness from upstream rate limits, latency spikes and response drift; the pipeline runs offline against the cassette
+- **Demo & dev offline** — work on a plane, show a prototype with the wifi off, debug without spending API credit
+- **Mock APIs without writing mocks** — no fixture files, no hand-rolled stub server; record once, the cassette _is_ the test data
+- **Drop-in for any language** — buffr is an HTTP proxy, not a library — works with Python, Go, Node, Rust, anything that speaks HTTP
 
 ## How it works
 
@@ -86,6 +95,36 @@ docker run \
 ```
 
 `mode` and `cassette` are optional per entry — defaults to `auto` and `<host>.json`.
+
+## Matching across non-deterministic requests
+
+Sometimes the request body or path contains per-run noise — a run ID, a UUID, a timestamp — that changes every invocation. Without help, no cassette entry ever matches a live request, and the cache hit rate collapses.
+
+Add `match.ignore` rules to rewrite those substrings before matching. The same rule runs on both the recorded request and the live one, so they normalize to the same signature.
+
+```yaml
+BUFFR_TARGETS: |
+  - target: http://192.168.178.27:1234
+    port: 8083
+    mode: auto
+    cassette: /data/lm-studio.json
+    match:
+      ignore:
+        # opencode embeds the per-run output path in the prompt;
+        # run_id is unique per run → no hit without normalization
+        - in: request.body
+          pattern: '/runs/\d{8}-\d{6}-\d{3}/'
+          replace_with: '/runs/<RUN_ID>/'
+        - in: request.path
+          pattern: '/tasks/[0-9a-f-]{36}'
+          replace_with: '/tasks/<TASK_ID>'
+```
+
+- `in`: `request.body` or `request.path`
+- `pattern`: Go regex syntax ([RE2](https://github.com/google/re2/wiki/Syntax))
+- `replace_with`: literal replacement text (use a placeholder like `<RUN_ID>` for readability)
+
+Invalid rules log a warning and are skipped — they don't take the proxy down.
 
 ## Configuration
 

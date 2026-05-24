@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -236,14 +237,29 @@ type instanceConfig struct {
 	target   *url.URL
 	port     int
 	cassette string
+	rules    []matcher.IgnoreRule
 }
 
 // yamlInstance is the per-entry schema for BUFFR_TARGETS YAML.
 type yamlInstance struct {
-	Target   string `yaml:"target"`
-	Port     int    `yaml:"port"`
-	Cassette string `yaml:"cassette"`
-	Mode     string `yaml:"mode"`
+	Target   string     `yaml:"target"`
+	Port     int        `yaml:"port"`
+	Cassette string     `yaml:"cassette"`
+	Mode     string     `yaml:"mode"`
+	Match    *yamlMatch `yaml:"match,omitempty"`
+}
+
+// yamlMatch holds optional matching tweaks for one target.
+type yamlMatch struct {
+	Ignore []yamlIgnoreRule `yaml:"ignore"`
+}
+
+// yamlIgnoreRule rewrites a substring of the request before matching so
+// per-run noise (run IDs, UUIDs, timestamps) does not defeat cassette hits.
+type yamlIgnoreRule struct {
+	In          string `yaml:"in"`           // request.body | request.path
+	Pattern     string `yaml:"pattern"`      // Go regex
+	ReplaceWith string `yaml:"replace_with"` // replacement text
 }
 
 // loadInstances resolves multi-instance config from the environment.
@@ -290,6 +306,40 @@ func parseYAMLTargets(raw string) []instanceConfig {
 			target:   u,
 			port:     port,
 			cassette: cassettePath(e.Cassette, u.Host),
+			rules:    compileIgnoreRules(e.Match, i),
+		})
+	}
+	return out
+}
+
+// compileIgnoreRules turns the per-target match.ignore YAML into ready-to-use
+// matcher.IgnoreRule values. Invalid entries (bad "in", bad regex) are logged
+// and skipped rather than failing the whole config — a typo in one rule should
+// not take down all proxies.
+func compileIgnoreRules(m *yamlMatch, instanceIdx int) []matcher.IgnoreRule {
+	if m == nil || len(m.Ignore) == 0 {
+		return nil
+	}
+	out := make([]matcher.IgnoreRule, 0, len(m.Ignore))
+	for j, r := range m.Ignore {
+		switch r.In {
+		case matcher.IgnoreInBody, matcher.IgnoreInPath:
+		default:
+			slog.Warn("invalid match.ignore.in, skipping rule",
+				"instance", instanceIdx, "rule", j, "in", r.In,
+				"allowed", []string{matcher.IgnoreInBody, matcher.IgnoreInPath})
+			continue
+		}
+		re, err := regexp.Compile(r.Pattern)
+		if err != nil {
+			slog.Warn("invalid match.ignore.pattern, skipping rule",
+				"instance", instanceIdx, "rule", j, "pattern", r.Pattern, "err", err)
+			continue
+		}
+		out = append(out, matcher.IgnoreRule{
+			In:          r.In,
+			Pattern:     re,
+			ReplaceWith: r.ReplaceWith,
 		})
 	}
 	return out
@@ -342,7 +392,7 @@ func runInstances(instances []instanceConfig) int {
 				slog.Error("failed to load cassette", "path", cfg.cassette, "err", err)
 				return 1
 			}
-			m := matcher.New(c, matcher.JSONBodyNormalizer)
+			m := matcher.New(c, matcher.JSONBodyNormalizer, cfg.rules...)
 			rep := proxy.NewWSReplayer(c)
 			mux = http.NewServeMux()
 			mux.Handle("/", routeUpgrade(
@@ -351,7 +401,7 @@ func runInstances(instances []instanceConfig) int {
 			))
 		default: // "auto"
 			rec, existing := proxy.NewAutoRecorder(cfg.cassette)
-			m := matcher.New(existing, matcher.JSONBodyNormalizer)
+			m := matcher.New(existing, matcher.JSONBodyNormalizer, cfg.rules...)
 			rep := proxy.NewWSReplayer(existing)
 			mux = http.NewServeMux()
 			mux.Handle("/", routeUpgrade(

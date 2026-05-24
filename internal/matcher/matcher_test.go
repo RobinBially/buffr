@@ -1,6 +1,7 @@
 package matcher
 
 import (
+	"regexp"
 	"testing"
 
 	"buffr/internal/cassette"
@@ -72,6 +73,57 @@ func TestJSONNormalizerFallsBackOnInvalidJSON(t *testing.T) {
 	m := New(c, JSONBodyNormalizer)
 	if got := m.Take("POST", "/x", "not json"); got == nil {
 		t.Fatalf("non-JSON body should still match exactly")
+	}
+}
+
+func TestIgnoreRuleBodyMatchesAcrossRuns(t *testing.T) {
+	// Real-world case: opencode embeds a per-run output path in the prompt.
+	// Without normalization the second run never hits the cassette.
+	recorded := `{"prompt":"write to /runs/20250101-120000-001/out.txt"}`
+	live := `{"prompt":"write to /runs/20260524-093045-042/out.txt"}`
+
+	c := &cassette.Cassette{Interactions: []cassette.Interaction{
+		ex("POST", "/v1/chat", recorded, 200),
+	}}
+	rule := IgnoreRule{
+		In:          IgnoreInBody,
+		Pattern:     regexp.MustCompile(`/runs/\d{8}-\d{6}-\d{3}/`),
+		ReplaceWith: "/runs/<RUN_ID>/",
+	}
+	m := New(c, JSONBodyNormalizer, rule)
+	if got := m.Take("POST", "/v1/chat", live); got == nil {
+		t.Fatalf("rule should normalize per-run ID so live request matches recorded one")
+	}
+}
+
+func TestIgnoreRulePathMatchesAcrossRuns(t *testing.T) {
+	c := &cassette.Cassette{Interactions: []cassette.Interaction{
+		ex("GET", "/v1/runs/20250101-120000-001/messages", "", 200),
+	}}
+	rule := IgnoreRule{
+		In:          IgnoreInPath,
+		Pattern:     regexp.MustCompile(`/runs/\d{8}-\d{6}-\d{3}/`),
+		ReplaceWith: "/runs/<RUN_ID>/",
+	}
+	m := New(c, nil, rule)
+	if got := m.Take("GET", "/v1/runs/20260524-093045-042/messages", ""); got == nil {
+		t.Fatalf("path rule should normalize per-run ID so live request matches recorded one")
+	}
+}
+
+func TestIgnoreRuleDoesNotCrossPaths(t *testing.T) {
+	// A body rule must not leak into path matching: differing paths still miss.
+	c := &cassette.Cassette{Interactions: []cassette.Interaction{
+		ex("POST", "/a", `{"id":"X"}`, 200),
+	}}
+	rule := IgnoreRule{
+		In:          IgnoreInBody,
+		Pattern:     regexp.MustCompile(`"id":"[^"]*"`),
+		ReplaceWith: `"id":"<ID>"`,
+	}
+	m := New(c, JSONBodyNormalizer, rule)
+	if m.Take("POST", "/b", `{"id":"Y"}`) != nil {
+		t.Errorf("body rule must not paper over path mismatch")
 	}
 }
 

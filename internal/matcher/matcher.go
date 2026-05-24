@@ -12,10 +12,29 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"regexp"
 	"strings"
 
 	"buffr/internal/cassette"
 )
+
+// Ignore "in" targets.
+const (
+	IgnoreInBody = "request.body"
+	IgnoreInPath = "request.path"
+)
+
+// IgnoreRule rewrites part of a request before its signature is computed so
+// that semantically equivalent requests with shifting per-run noise (UUIDs,
+// timestamps, run IDs) still hash the same. Both the recorded request and the
+// incoming request pass through the same rules — a recorded body containing
+// "/runs/20250101-120000-001/" and a live body containing
+// "/runs/20260524-093045-042/" both normalize to "/runs/<RUN_ID>/" and match.
+type IgnoreRule struct {
+	In          string         // IgnoreInBody or IgnoreInPath
+	Pattern     *regexp.Regexp // regex matching the substring to rewrite
+	ReplaceWith string         // replacement string (may be empty)
+}
 
 // Normalizer transforms a recorded or live request body into a canonical form
 // before hashing. Returning the input unchanged is a valid no-op normalizer.
@@ -34,18 +53,21 @@ type Normalizer func(method, path, body string) string
 // the same prompt produces different completions across iterations.
 type Matcher struct {
 	normalizer Normalizer
+	rules      []IgnoreRule
 	pool       []*cassette.HTTPExchange
 }
 
 // New returns a Matcher seeded from the HTTP exchanges in `c`. Non-HTTP
 // interactions are ignored (the WS path uses its own matcher).
 //
-// If normalizer is nil, ExactBodyNormalizer is used.
-func New(c *cassette.Cassette, normalizer Normalizer) *Matcher {
+// If normalizer is nil, ExactBodyNormalizer is used. Optional rules rewrite
+// path/body substrings before hashing so non-deterministic noise (run IDs,
+// UUIDs) does not defeat matching.
+func New(c *cassette.Cassette, normalizer Normalizer, rules ...IgnoreRule) *Matcher {
 	if normalizer == nil {
 		normalizer = ExactBodyNormalizer
 	}
-	m := &Matcher{normalizer: normalizer}
+	m := &Matcher{normalizer: normalizer, rules: rules}
 	for _, it := range c.Interactions {
 		if it.Type == "http" && it.HTTP != nil {
 			m.pool = append(m.pool, it.HTTP)
@@ -75,6 +97,14 @@ func (m *Matcher) Remaining() int {
 }
 
 func (m *Matcher) signature(method, path, body string) string {
+	for _, r := range m.rules {
+		switch r.In {
+		case IgnoreInBody:
+			body = r.Pattern.ReplaceAllString(body, r.ReplaceWith)
+		case IgnoreInPath:
+			path = r.Pattern.ReplaceAllString(path, r.ReplaceWith)
+		}
+	}
 	normalized := m.normalizer(method, path, body)
 	h := sha256.New()
 	h.Write([]byte(method))

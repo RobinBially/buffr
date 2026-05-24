@@ -2,6 +2,8 @@ package main
 
 import (
 	"testing"
+
+	"buffr/internal/matcher"
 )
 
 func TestCassettePath(t *testing.T) {
@@ -117,6 +119,83 @@ func TestParseYAMLTargets(t *testing.T) {
 			t.Errorf("want empty, got %d instances", len(got))
 		}
 	})
+}
+
+func TestParseYAMLTargetsWithMatchIgnore(t *testing.T) {
+	yaml := `
+- target: http://lm-studio.local:1234
+  port: 8083
+  cassette: /data/lm-studio.json
+  match:
+    ignore:
+      - in: request.body
+        pattern: '/runs/\d{8}-\d{6}-\d{3}/'
+        replace_with: '/runs/<RUN_ID>/'
+      - in: request.path
+        pattern: '/tasks/[0-9a-f-]+'
+        replace_with: '/tasks/<TASK_ID>'
+`
+	got := parseYAMLTargets(yaml)
+	if len(got) != 1 {
+		t.Fatalf("want 1 instance, got %d", len(got))
+	}
+	if len(got[0].rules) != 2 {
+		t.Fatalf("want 2 ignore rules, got %d", len(got[0].rules))
+	}
+	if got[0].rules[0].In != matcher.IgnoreInBody {
+		t.Errorf("rule 0 In = %q, want %q", got[0].rules[0].In, matcher.IgnoreInBody)
+	}
+	if got[0].rules[0].ReplaceWith != "/runs/<RUN_ID>/" {
+		t.Errorf("rule 0 ReplaceWith = %q", got[0].rules[0].ReplaceWith)
+	}
+	if !got[0].rules[0].Pattern.MatchString("/runs/20250101-120000-001/") {
+		t.Errorf("rule 0 pattern should match a run-id path")
+	}
+	if got[0].rules[1].In != matcher.IgnoreInPath {
+		t.Errorf("rule 1 In = %q, want %q", got[0].rules[1].In, matcher.IgnoreInPath)
+	}
+}
+
+func TestParseYAMLTargetsSkipsInvalidIgnoreRules(t *testing.T) {
+	yaml := `
+- target: http://example.com
+  port: 8083
+  match:
+    ignore:
+      - in: request.headers          # unsupported "in"
+        pattern: 'foo'
+        replace_with: 'bar'
+      - in: request.body
+        pattern: '['                  # invalid regex
+        replace_with: ''
+      - in: request.body              # this one is valid
+        pattern: 'abc'
+        replace_with: 'xyz'
+`
+	got := parseYAMLTargets(yaml)
+	if len(got) != 1 {
+		t.Fatalf("want 1 instance, got %d", len(got))
+	}
+	if len(got[0].rules) != 1 {
+		t.Fatalf("want 1 valid rule (2 invalid skipped), got %d", len(got[0].rules))
+	}
+	if got[0].rules[0].Pattern.String() != "abc" {
+		t.Errorf("surviving rule pattern = %q, want abc", got[0].rules[0].Pattern.String())
+	}
+}
+
+func TestParseYAMLTargetsNoMatchBlock(t *testing.T) {
+	yaml := `
+- target: https://api.openai.com
+  port: 8081
+`
+	got := parseYAMLTargets(yaml)
+	if len(got) != 1 {
+		t.Fatalf("want 1 instance, got %d", len(got))
+	}
+	if got[0].rules != nil {
+		t.Errorf("want nil rules when no match block, got %v", got[0].rules)
+	}
 }
 
 func TestParseIndexedTargets(t *testing.T) {
