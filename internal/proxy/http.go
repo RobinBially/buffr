@@ -42,6 +42,67 @@ func (r *Recorder) Append(it cassette.Interaction) error {
 	return cassette.Save(r.path, r.cassette)
 }
 
+// NewAutoRecorder creates a Recorder pre-seeded from an existing cassette file.
+// If the file does not exist yet, an empty cassette is used. The returned
+// cassette snapshot can be handed to matcher.New so the auto handler can
+// match against already-recorded interactions.
+func NewAutoRecorder(path string) (*Recorder, *cassette.Cassette) {
+	c, err := cassette.Load(path)
+	if err != nil {
+		c = &cassette.Cassette{Version: cassette.CurrentVersion}
+	}
+	return &Recorder{cassette: c, path: path}, c
+}
+
+// AutoHandler is the record-on-miss handler: it serves from the cassette when
+// a match exists, and falls back to forwarding + recording when it does not.
+// This lets tests run fully offline once every interaction has been captured,
+// while still accumulating new cassette entries transparently on first run.
+func AutoHandler(target *url.URL, rec *Recorder, m *matcher.Matcher) http.Handler {
+	record := RecordHandler(target, rec)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "buffr: failed to read request body: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		r.Body.Close()
+
+		ex := m.Take(r.Method, r.URL.Path, string(body))
+		if ex == nil {
+			// Cache miss — forward to upstream and record.
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			record.ServeHTTP(w, r)
+			return
+		}
+
+		// Cache hit — replay from cassette.
+		for k, vs := range ex.Response.Headers {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(ex.Response.Status)
+		flusher, _ := w.(http.Flusher)
+
+		if len(ex.Response.BodyChunks) > 0 {
+			for _, c := range ex.Response.BodyChunks {
+				if c.DelayMs > 0 {
+					time.Sleep(time.Duration(c.DelayMs) * time.Millisecond)
+				}
+				if _, werr := w.Write([]byte(c.Data)); werr != nil {
+					return
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			return
+		}
+		_, _ = w.Write([]byte(ex.Response.Body))
+	})
+}
+
 // RecordHandler returns an http.Handler that proxies every request to `target`
 // and writes the round-trip to the recorder. It supports `text/event-stream`
 // responses by streaming chunks through and capturing each chunk with the

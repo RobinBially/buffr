@@ -27,6 +27,20 @@ var upgrader = websocket.Upgrader{
 	HandshakeTimeout: 30 * time.Second,
 }
 
+// AutoWSHandler replays the next recorded WebSocket session when one is
+// available, and falls back to forwarding + recording when the cassette is
+// exhausted. Matches the record-on-miss semantics of AutoHandler.
+func AutoWSHandler(target *url.URL, rec *Recorder, rep *wsReplayer) http.Handler {
+	record := RecordWSHandler(target, rec)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if rep.Remaining() > 0 {
+			ReplayWSHandler(rep).ServeHTTP(w, r)
+			return
+		}
+		record.ServeHTTP(w, r)
+	})
+}
+
 // RecordWSHandler proxies WebSocket connections to the upstream target and
 // records every frame in both directions to the recorder.
 //
