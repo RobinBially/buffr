@@ -4,9 +4,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +50,7 @@ func AutoWSHandler(target *url.URL, rec *Recorder, rep *wsReplayer) http.Handler
 // partial recording is flushed so debugging is possible.
 func RecordWSHandler(target *url.URL, rec *Recorder) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		clientConn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			// upgrader already responded with an error status
@@ -67,7 +68,7 @@ func RecordWSHandler(target *url.URL, rec *Recorder) http.Handler {
 
 		upConn, upResp, err := websocket.DefaultDialer.Dial(upstreamURL.String(), upstreamHeader)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "buffr: ws dial to %s failed: %v\n", upstreamURL.String(), err)
+			slog.Error("WS "+r.URL.Path, "err", err, "src", "upstream")
 			if upResp != nil {
 				upResp.Body.Close()
 			}
@@ -154,8 +155,12 @@ func RecordWSHandler(target *url.URL, rec *Recorder) http.Handler {
 
 		<-closeCh
 		if err := rec.Append(cassette.Interaction{Type: "websocket", WebSocket: session}); err != nil {
-			fmt.Fprintf(os.Stderr, "buffr: failed to append ws session: %v\n", err)
+			slog.Warn("WS cassette write failed", "path", r.URL.Path, "err", err)
 		}
+		slog.Info("WS "+r.URL.Path,
+			"frames", len(session.Frames),
+			"dur", fmtDur(time.Since(start)),
+			"src", "upstream")
 	})
 }
 
@@ -206,8 +211,10 @@ func (r *wsReplayer) take() *cassette.WSSession {
 // is rejected with a 599 — same convention as the HTTP replay miss.
 func ReplayWSHandler(rep *wsReplayer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		session := rep.take()
 		if session == nil {
+			slog.Warn("WS "+r.URL.Path, "src", "miss")
 			http.Error(w, "buffr: no cassette ws session for "+r.URL.Path, 599)
 			return
 		}
@@ -221,6 +228,10 @@ func ReplayWSHandler(rep *wsReplayer) http.Handler {
 		// to the client (honoring delay), client-to-server are read and
 		// validated. When the next recorded frame is c→s, block on reading
 		// until the client sends; when it's s→c, sleep + write.
+		slog.Info("WS "+r.URL.Path,
+			"frames", len(session.Frames),
+			"dur", fmtDur(time.Since(start)),
+			"src", "cassette")
 		cursor := 0
 		for cursor < len(session.Frames) {
 			f := session.Frames[cursor]
@@ -244,15 +255,13 @@ func ReplayWSHandler(rep *wsReplayer) http.Handler {
 					// frame is also a close. Otherwise emit a clear error
 					// before returning so the test sees what diverged.
 					if f.Opcode != cassette.OpClose {
-						fmt.Fprintf(os.Stderr,
-							"buffr: cassette drift — recorded frame[%d] is c→s %s but client closed: %v\n",
-							cursor, f.Opcode, err)
+						slog.Warn("WS cassette drift: client closed early",
+							"path", r.URL.Path, "frame", cursor, "opcode", f.Opcode, "err", err)
 					}
 					return
 				}
 				if err := validateFrame(f, msgType, payload); err != nil {
-					fmt.Fprintf(os.Stderr,
-						"buffr: cassette drift at frame[%d]: %v\n", cursor, err)
+					slog.Warn("WS cassette drift", "path", r.URL.Path, "frame", cursor, "err", err)
 					_ = conn.WriteControl(
 						websocket.CloseMessage,
 						websocket.FormatCloseMessage(1011, "buffr: cassette drift"),

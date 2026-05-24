@@ -16,6 +16,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,6 +32,15 @@ import (
 )
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				return slog.String(slog.TimeKey, a.Value.Time().Format("15:04:05.000"))
+			}
+			return a
+		},
+	})))
+
 	// Allow BUFFR_MODE to supply the subcommand when no CLI argument is given,
 	// which is the typical Docker entrypoint pattern.
 	args := os.Args[1:]
@@ -106,7 +116,7 @@ func envInt(key string, fallback int) int {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
 		}
-		fmt.Fprintf(os.Stderr, "buffr: invalid %s=%q, using default %d\n", key, v, fallback)
+		slog.Warn("invalid env var, using default", "key", key, "value", v, "default", fallback)
 	}
 	return fallback
 }
@@ -231,7 +241,7 @@ func loadInstances() []instanceConfig {
 		}
 		u, err := url.Parse(rawTarget)
 		if err != nil || u.Scheme == "" || u.Host == "" {
-			fmt.Fprintf(os.Stderr, "buffr: invalid %sTARGET=%q, skipping\n", pfx, rawTarget)
+			slog.Warn("invalid target, skipping instance", "key", pfx+"TARGET", "value", rawTarget)
 			continue
 		}
 		mode := os.Getenv(pfx + "MODE")
@@ -263,7 +273,7 @@ func runInstances(instances []instanceConfig) int {
 		case "replay":
 			c, err := cassette.Load(cfg.cassette)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "buffr: failed to load cassette %s: %v\n", cfg.cassette, err)
+				slog.Error("failed to load cassette", "path", cfg.cassette, "err", err)
 				return 1
 			}
 			m := matcher.New(c, matcher.JSONBodyNormalizer)
@@ -287,10 +297,9 @@ func runInstances(instances []instanceConfig) int {
 		srv := &http.Server{Addr: addr, Handler: mux}
 		servers = append(servers, srv)
 		go func() {
-			fmt.Fprintf(os.Stderr, "buffr %s on %s → target=%s cassette=%s\n",
-				cfg.mode, addr, cfg.target, cfg.cassette)
+			slog.Info("listening", "mode", cfg.mode, "addr", addr, "target", cfg.target, "cassette", cfg.cassette)
 			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				fmt.Fprintf(os.Stderr, "buffr: server error on %s: %v\n", addr, err)
+				slog.Error("server error", "addr", addr, "err", err)
 			}
 		}()
 	}
@@ -298,7 +307,7 @@ func runInstances(instances []instanceConfig) int {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
-	fmt.Fprintln(os.Stderr, "buffr: shutting down…")
+	slog.Info("shutting down")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	for _, srv := range servers {
@@ -311,16 +320,16 @@ func serve(port int, h http.Handler, mode, cass string) int {
 	addr := fmt.Sprintf(":%d", port)
 	srv := &http.Server{Addr: addr, Handler: h}
 	go func() {
-		fmt.Fprintf(os.Stderr, "buffr %s on %s → cassette=%s\n", mode, addr, cass)
+		slog.Info("listening", "mode", mode, "addr", addr, "cassette", cass)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			fmt.Fprintf(os.Stderr, "buffr: server error: %v\n", err)
+			slog.Error("server error", "err", err)
 		}
 	}()
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
-	fmt.Fprintln(os.Stderr, "buffr: shutting down…")
+	slog.Info("shutting down")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)

@@ -5,15 +5,22 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
-	"os"
 	"sync"
 	"time"
 
 	"buffr/internal/cassette"
 	"buffr/internal/matcher"
 )
+
+func fmtDur(d time.Duration) string {
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	return fmt.Sprintf("%.1fs", d.Seconds())
+}
 
 // Recorder is a synchronization wrapper around a Cassette so the HTTP and WS
 // handlers can append interactions concurrently. The cassette is flushed to
@@ -61,6 +68,7 @@ func NewAutoRecorder(path string) (*Recorder, *cassette.Cassette) {
 func AutoHandler(target *url.URL, rec *Recorder, m *matcher.Matcher) http.Handler {
 	record := RecordHandler(target, rec)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "buffr: failed to read request body: "+err.Error(), http.StatusInternalServerError)
@@ -70,7 +78,7 @@ func AutoHandler(target *url.URL, rec *Recorder, m *matcher.Matcher) http.Handle
 
 		ex := m.Take(r.Method, r.URL.Path, string(body))
 		if ex == nil {
-			// Cache miss — forward to upstream and record.
+			// Cache miss — RecordHandler logs this as src=upstream.
 			r.Body = io.NopCloser(bytes.NewReader(body))
 			record.ServeHTTP(w, r)
 			return
@@ -97,9 +105,13 @@ func AutoHandler(target *url.URL, rec *Recorder, m *matcher.Matcher) http.Handle
 					flusher.Flush()
 				}
 			}
-			return
+		} else {
+			_, _ = w.Write([]byte(ex.Response.Body))
 		}
-		_, _ = w.Write([]byte(ex.Response.Body))
+		slog.Info(r.Method+" "+r.URL.Path,
+			"status", ex.Response.Status,
+			"dur", fmtDur(time.Since(start)),
+			"src", "cassette")
 	})
 }
 
@@ -113,8 +125,10 @@ func AutoHandler(target *url.URL, rec *Recorder, m *matcher.Matcher) http.Handle
 // recording.
 func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
+			slog.Error("failed to read request body", "err", err)
 			http.Error(w, "buffr: failed to read request body: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -126,6 +140,7 @@ func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 
 		upReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstream.String(), bytes.NewReader(body))
 		if err != nil {
+			slog.Error("failed to build upstream request", "err", err)
 			http.Error(w, "buffr: failed to build upstream request: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -133,6 +148,7 @@ func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 
 		resp, err := http.DefaultTransport.RoundTrip(upReq)
 		if err != nil {
+			slog.Error(r.Method+" "+r.URL.Path, "err", err, "src", "upstream")
 			http.Error(w, "buffr: upstream request failed: "+err.Error(), http.StatusBadGateway)
 			return
 		}
@@ -145,11 +161,6 @@ func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 
 		isSSE := isEventStream(resp.Header)
 		if isSSE {
-			// Streaming path: write headers + chunks live so the client sees
-			// SSE events in real time, capturing inter-chunk delays. Append
-			// happens after the upstream EOF — the connection stays open
-			// until then, so the client's read loop sees the recorded data
-			// before the cassette save races with test continuation.
 			copyHeadersExceptHopByHop(w.Header(), resp.Header)
 			w.WriteHeader(resp.StatusCode)
 			flusher, _ := w.(http.Flusher)
@@ -177,12 +188,9 @@ func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 				}
 			}
 		} else {
-			// Non-streaming path: buffer first, save cassette, THEN write
-			// to client. Otherwise the client's Content-Length-aware reader
-			// could finish before the handler's Append call, racing the
-			// "tests read cassette right after the call" pattern.
 			full, readErr := io.ReadAll(resp.Body)
 			if readErr != nil && readErr != io.EOF {
+				slog.Error("upstream body read failed", "err", readErr)
 				http.Error(w, "buffr: upstream body read failed: "+readErr.Error(), http.StatusBadGateway)
 				return
 			}
@@ -202,10 +210,13 @@ func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 				Response: recordedResp,
 			},
 		}); appendErr != nil {
-			// Persistence failure is loud — recording is the whole point of
-			// this handler, and a silent miss makes test debugging miserable.
-			fmt.Fprintf(os.Stderr, "buffr: failed to append to cassette: %v\n", appendErr)
+			slog.Warn("cassette write failed", "err", appendErr)
 		}
+
+		slog.Info(r.Method+" "+r.URL.Path,
+			"status", resp.StatusCode,
+			"dur", fmtDur(time.Since(start)),
+			"src", "upstream")
 
 		if !isSSE {
 			copyHeadersExceptHopByHop(w.Header(), resp.Header)
@@ -221,6 +232,7 @@ func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 // failures point at the proxy rather than the application.
 func ReplayHandler(m *matcher.Matcher) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "buffr: failed to read request body: "+err.Error(), http.StatusInternalServerError)
@@ -230,6 +242,7 @@ func ReplayHandler(m *matcher.Matcher) http.Handler {
 
 		ex := m.Take(r.Method, r.URL.Path, string(body))
 		if ex == nil {
+			slog.Warn(r.Method+" "+r.URL.Path, "src", "miss")
 			http.Error(w, fmt.Sprintf("buffr: no cassette match for %s %s", r.Method, r.URL.Path), 599)
 			return
 		}
@@ -254,9 +267,13 @@ func ReplayHandler(m *matcher.Matcher) http.Handler {
 					flusher.Flush()
 				}
 			}
-			return
+		} else {
+			_, _ = w.Write([]byte(ex.Response.Body))
 		}
-		_, _ = w.Write([]byte(ex.Response.Body))
+		slog.Info(r.Method+" "+r.URL.Path,
+			"status", ex.Response.Status,
+			"dur", fmtDur(time.Since(start)),
+			"src", "cassette")
 	})
 }
 
