@@ -102,10 +102,20 @@ Multi-instance — YAML list (recommended):
   - target: https://api.anthropic.com
     port: 8082'
 
+  Per-entry fields: target (required), port, cassette, mode, match.ignore.
+  match.ignore rewrites per-run noise (run IDs, UUIDs) so cassette matches hit
+  even when the body or path varies between runs:
+    match:
+      ignore:
+        - in: request.body       # or request.path
+          pattern: '/runs/\d{8}-\d{6}-\d{3}/'
+          replace_with: '/runs/<RUN_ID>/'
+
 Multi-instance — indexed env vars (alternative):
   BUFFR_0_TARGET=https://api.openai.com   BUFFR_0_PORT=8081
   BUFFR_1_TARGET=https://api.anthropic.com BUFFR_1_PORT=8082
-  (BUFFR_N_CASSETTE and BUFFR_N_MODE optional; indices must be contiguous from 0)
+  (BUFFR_N_CASSETTE and BUFFR_N_MODE optional; indices must be contiguous from 0;
+   match.ignore is only available via BUFFR_TARGETS YAML)
 
 Examples:
   buffr auto --target https://api.openai.com --port 8080
