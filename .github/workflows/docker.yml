@@ -7,6 +7,14 @@ on:
   pull_request:
     branches: [main]
 
+# Serialize runs that share a commit (e.g. main-push and tag-push for the
+# same SHA when releasing). Letting them queue means the second run can
+# retag the image the first run produced instead of rebuilding identical
+# code from scratch.
+concurrency:
+  group: docker-${{ github.sha }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -74,7 +82,25 @@ jobs:
             # short SHA for traceability
             type=sha
 
+      # Probe whether an image for this commit already exists in the registry
+      # (almost always: a main-push run that just finished). If so we skip the
+      # rebuild and only attach the new ref's tags. PRs and the very first
+      # build of a SHA fall through to the full build step.
+      - name: Check for existing image
+        id: probe
+        if: github.event_name != 'pull_request'
+        run: |
+          short=$(echo "${{ github.sha }}" | cut -c1-7)
+          src="ghcr.io/${{ github.repository }}:sha-$short"
+          if docker buildx imagetools inspect "$src" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "src=$src" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push
+        if: steps.probe.outputs.exists != 'true'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -84,3 +110,17 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Server-side retag: copies no layers, just creates new tag pointers
+      # to the existing manifest. Multi-arch indexes are preserved.
+      - name: Retag existing image
+        if: steps.probe.outputs.exists == 'true'
+        env:
+          SRC: ${{ steps.probe.outputs.src }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "retag: $tag <- $SRC"
+            docker buildx imagetools create -t "$tag" "$SRC"
+          done <<< "$TAGS"
