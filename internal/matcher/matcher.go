@@ -30,10 +30,25 @@ const (
 // incoming request pass through the same rules — a recorded body containing
 // "/runs/20250101-120000-001/" and a live body containing
 // "/runs/20260524-093045-042/" both normalize to "/runs/<RUN_ID>/" and match.
+//
+// When SyncResponse is true, the literal substring matched in the live
+// request is also propagated into the replayed response: whatever the recorded
+// response contains at the spot where the original run-time value sat gets
+// swapped for the value from the current request. That keeps echoed IDs
+// (run IDs, request IDs, idempotency keys) consistent for the caller — they
+// see their own value reflected back, not the one frozen at record time.
 type IgnoreRule struct {
-	In          string         // IgnoreInBody or IgnoreInPath
-	Pattern     *regexp.Regexp // regex matching the substring to rewrite
-	ReplaceWith string         // replacement string (may be empty)
+	In           string         // IgnoreInBody or IgnoreInPath
+	Pattern      *regexp.Regexp // regex matching the substring to rewrite
+	ReplaceWith  string         // replacement string (may be empty)
+	SyncResponse bool           // propagate live request value into replayed response
+}
+
+// SyncReplacement is one substitution to apply to a replayed response body:
+// every occurrence of From is replaced with To. Returned by
+// ComputeSyncReplacements for the proxy to apply at write time.
+type SyncReplacement struct {
+	From, To string
 }
 
 // Normalizer transforms a recorded or live request body into a canonical form
@@ -94,6 +109,108 @@ func (m *Matcher) Take(method, path, body string) *cassette.HTTPExchange {
 // Useful at the end of a test to assert the cassette was fully consumed.
 func (m *Matcher) Remaining() int {
 	return len(m.pool)
+}
+
+// Rules exposes the rule list for callers that need to drive record-time
+// capture extraction or replay-time response rewriting (the proxy package).
+func (m *Matcher) Rules() []IgnoreRule {
+	return m.rules
+}
+
+// ExtractCaptures runs each SyncResponse rule against the request and
+// returns the literal substring each rule actually matched. Called at record
+// time so the cassette knows what value was sitting in that spot, which
+// replay later swaps for the live request's value.
+//
+// Rules without SyncResponse, rules whose target field is empty, and rules
+// whose pattern does not match are silently skipped — they contribute no
+// capture.
+func ExtractCaptures(rules []IgnoreRule, method, path, body string) []cassette.Capture {
+	var out []cassette.Capture
+	for _, r := range rules {
+		if !r.SyncResponse {
+			continue
+		}
+		var src string
+		switch r.In {
+		case IgnoreInBody:
+			src = body
+		case IgnoreInPath:
+			src = path
+		default:
+			continue
+		}
+		if found := r.Pattern.FindString(src); found != "" {
+			out = append(out, cassette.Capture{
+				Pattern:  r.Pattern.String(),
+				Captured: found,
+			})
+		}
+	}
+	return out
+}
+
+// ComputeSyncReplacements pairs each rule's live match with the substring the
+// same rule captured at record time, returning the (recorded, live) pairs the
+// proxy should apply to the response. A rule contributes nothing when:
+//
+//   - the rule is not SyncResponse,
+//   - the rule's pattern does not match the live request,
+//   - the cassette has no capture for the rule's pattern, or
+//   - the live and recorded values are identical (replacement would be a no-op).
+//
+// Capture lookup is by pattern source string, so config-time rule reordering
+// stays safe between record and replay.
+func ComputeSyncReplacements(rules []IgnoreRule, method, path, liveBody string, ex *cassette.HTTPExchange) []SyncReplacement {
+	if ex == nil || ex.Match == nil || len(ex.Match.Captures) == 0 {
+		return nil
+	}
+	var out []SyncReplacement
+	for _, r := range rules {
+		if !r.SyncResponse {
+			continue
+		}
+		var src string
+		switch r.In {
+		case IgnoreInBody:
+			src = liveBody
+		case IgnoreInPath:
+			src = path
+		default:
+			continue
+		}
+		live := r.Pattern.FindString(src)
+		if live == "" {
+			continue
+		}
+		recorded := findCapture(ex.Match.Captures, r.Pattern.String())
+		if recorded == "" || recorded == live {
+			continue
+		}
+		out = append(out, SyncReplacement{From: recorded, To: live})
+	}
+	return out
+}
+
+// ApplyReplacements applies sync_response substitutions to a response body
+// fragment. Used both for whole bodies and individual SSE chunks; for chunks
+// this means a captured value split across chunk boundaries is not rewritten.
+// Captured values like UUIDs and timestamps are short enough that this is
+// extremely rare in practice and the simplicity is worth it.
+func ApplyReplacements(s string, repls []SyncReplacement) string {
+	for _, r := range repls {
+		s = strings.ReplaceAll(s, r.From, r.To)
+	}
+	return s
+}
+
+func findCapture(caps []cassette.Capture, pattern string) string {
+	for _, c := range caps {
+		if c.Pattern == pattern {
+			return c.Captured
+		}
+	}
+	return ""
 }
 
 func (m *Matcher) signature(method, path, body string) string {

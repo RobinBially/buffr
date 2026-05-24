@@ -127,6 +127,82 @@ func TestIgnoreRuleDoesNotCrossPaths(t *testing.T) {
 	}
 }
 
+func TestExtractCapturesRecordsLiteralMatch(t *testing.T) {
+	rules := []IgnoreRule{
+		{
+			In:           IgnoreInBody,
+			Pattern:      regexp.MustCompile(`/runs/\d{8}-\d{6}-\d{3}/`),
+			SyncResponse: true,
+		},
+	}
+	caps := ExtractCaptures(rules, "POST", "/v1/chat", `{"path":"/runs/20260524-140516-982/out.txt"}`)
+	if len(caps) != 1 {
+		t.Fatalf("want 1 capture, got %d", len(caps))
+	}
+	if caps[0].Captured != "/runs/20260524-140516-982/" {
+		t.Errorf("captured = %q", caps[0].Captured)
+	}
+	if caps[0].Pattern != `/runs/\d{8}-\d{6}-\d{3}/` {
+		t.Errorf("pattern stored = %q", caps[0].Pattern)
+	}
+}
+
+func TestExtractCapturesSkipsNonSyncRule(t *testing.T) {
+	rules := []IgnoreRule{
+		{In: IgnoreInBody, Pattern: regexp.MustCompile(`abc`)}, // no SyncResponse
+	}
+	if caps := ExtractCaptures(rules, "POST", "/", "abc"); len(caps) != 0 {
+		t.Errorf("non-sync rules should yield no captures, got %v", caps)
+	}
+}
+
+func TestComputeSyncReplacementsPairsLiveAndRecorded(t *testing.T) {
+	rule := IgnoreRule{
+		In:           IgnoreInBody,
+		Pattern:      regexp.MustCompile(`/runs/\d{8}-\d{6}-\d{3}/`),
+		SyncResponse: true,
+	}
+	ex := &cassette.HTTPExchange{
+		Match: &cassette.MatchMeta{Captures: []cassette.Capture{
+			{Pattern: `/runs/\d{8}-\d{6}-\d{3}/`, Captured: "/runs/20260524-140516-982/"},
+		}},
+	}
+	live := `{"path":"/runs/20260524-140543-781/out.txt"}`
+	reps := ComputeSyncReplacements([]IgnoreRule{rule}, "POST", "/v1/chat", live, ex)
+	if len(reps) != 1 {
+		t.Fatalf("want 1 replacement, got %d", len(reps))
+	}
+	if reps[0].From != "/runs/20260524-140516-982/" || reps[0].To != "/runs/20260524-140543-781/" {
+		t.Errorf("replacement wrong: %+v", reps[0])
+	}
+}
+
+func TestComputeSyncReplacementsSkipsWhenIdentical(t *testing.T) {
+	rule := IgnoreRule{
+		In:           IgnoreInBody,
+		Pattern:      regexp.MustCompile(`abc`),
+		SyncResponse: true,
+	}
+	ex := &cassette.HTTPExchange{
+		Match: &cassette.MatchMeta{Captures: []cassette.Capture{{Pattern: `abc`, Captured: "abc"}}},
+	}
+	reps := ComputeSyncReplacements([]IgnoreRule{rule}, "POST", "/", "abc", ex)
+	if len(reps) != 0 {
+		t.Errorf("identical live/recorded should not produce a replacement; got %v", reps)
+	}
+}
+
+func TestApplyReplacements(t *testing.T) {
+	out := ApplyReplacements(
+		`{"id":"OLD","other":"OLD","tag":"NEW"}`,
+		[]SyncReplacement{{From: "OLD", To: "NEW"}},
+	)
+	want := `{"id":"NEW","other":"NEW","tag":"NEW"}`
+	if out != want {
+		t.Errorf("got %q want %q", out, want)
+	}
+}
+
 func TestSkipsNonHTTP(t *testing.T) {
 	c := &cassette.Cassette{Interactions: []cassette.Interaction{
 		{Type: "websocket", WebSocket: &cassette.WSSession{}},

@@ -115,6 +115,7 @@ BUFFR_TARGETS: |
         - in: request.body
           pattern: '/runs/\d{8}-\d{6}-\d{3}/'
           replace_with: '/runs/<RUN_ID>/'
+          sync_response: true   # echo live run_id back in the response
         - in: request.path
           pattern: '/tasks/[0-9a-f-]{36}'
           replace_with: '/tasks/<TASK_ID>'
@@ -123,6 +124,7 @@ BUFFR_TARGETS: |
 - `in`: `request.body` or `request.path`
 - `pattern`: Go regex syntax ([RE2](https://github.com/google/re2/wiki/Syntax))
 - `replace_with`: literal replacement text (use a placeholder like `<RUN_ID>` for readability)
+- `sync_response` _(optional, default false)_: when the upstream echoes the same ID back in its response (e.g. `"run_id": "..."`), buffr records the value the rule matched and, at replay time, swaps it for the current request's value — the client sees its own ID reflected, not the one frozen at record time.
 
 Invalid rules log a warning and are skipped — they don't take the proxy down.
 

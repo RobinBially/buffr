@@ -107,9 +107,10 @@ Multi-instance — YAML list (recommended):
   even when the body or path varies between runs:
     match:
       ignore:
-        - in: request.body       # or request.path
+        - in: request.body         # or request.path
           pattern: '/runs/\d{8}-\d{6}-\d{3}/'
           replace_with: '/runs/<RUN_ID>/'
+          sync_response: true      # echo the live value back in the response
 
 Multi-instance — indexed env vars (alternative):
   BUFFR_0_TARGET=https://api.openai.com   BUFFR_0_PORT=8081
@@ -266,10 +267,13 @@ type yamlMatch struct {
 
 // yamlIgnoreRule rewrites a substring of the request before matching so
 // per-run noise (run IDs, UUIDs, timestamps) does not defeat cassette hits.
+// SyncResponse additionally propagates the live request's matched value into
+// the replayed response.
 type yamlIgnoreRule struct {
-	In          string `yaml:"in"`           // request.body | request.path
-	Pattern     string `yaml:"pattern"`      // Go regex
-	ReplaceWith string `yaml:"replace_with"` // replacement text
+	In           string `yaml:"in"`            // request.body | request.path
+	Pattern      string `yaml:"pattern"`       // Go regex
+	ReplaceWith  string `yaml:"replace_with"`  // replacement text
+	SyncResponse bool   `yaml:"sync_response"` // echo live value in replayed response
 }
 
 // loadInstances resolves multi-instance config from the environment.
@@ -347,9 +351,10 @@ func compileIgnoreRules(m *yamlMatch, instanceIdx int) []matcher.IgnoreRule {
 			continue
 		}
 		out = append(out, matcher.IgnoreRule{
-			In:          r.In,
-			Pattern:     re,
-			ReplaceWith: r.ReplaceWith,
+			In:           r.In,
+			Pattern:      re,
+			ReplaceWith:  r.ReplaceWith,
+			SyncResponse: r.SyncResponse,
 		})
 	}
 	return out
@@ -390,7 +395,7 @@ func runInstances(instances []instanceConfig) int {
 		var mux *http.ServeMux
 		switch cfg.mode {
 		case "record":
-			rec := proxy.NewRecorder(cfg.cassette)
+			rec := proxy.NewRecorder(cfg.cassette, cfg.rules...)
 			mux = http.NewServeMux()
 			mux.Handle("/", routeUpgrade(
 				proxy.RecordWSHandler(cfg.target, rec),
@@ -410,7 +415,7 @@ func runInstances(instances []instanceConfig) int {
 				proxy.ReplayHandler(m),
 			))
 		default: // "auto"
-			rec, existing := proxy.NewAutoRecorder(cfg.cassette)
+			rec, existing := proxy.NewAutoRecorder(cfg.cassette, cfg.rules...)
 			m := matcher.New(existing, matcher.JSONBodyNormalizer, cfg.rules...)
 			rep := proxy.NewWSReplayer(existing)
 			mux = http.NewServeMux()

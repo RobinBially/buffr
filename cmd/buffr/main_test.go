@@ -156,6 +156,32 @@ func TestParseYAMLTargetsWithMatchIgnore(t *testing.T) {
 	}
 }
 
+func TestParseYAMLTargetsSyncResponse(t *testing.T) {
+	yaml := `
+- target: http://lm-studio.local:1234
+  match:
+    ignore:
+      - in: request.body
+        pattern: 'foo'
+        replace_with: 'FOO'
+        sync_response: true
+      - in: request.body
+        pattern: 'bar'
+        replace_with: 'BAR'
+        # sync_response omitted -> defaults to false
+`
+	got := parseYAMLTargets(yaml)
+	if len(got) != 1 || len(got[0].rules) != 2 {
+		t.Fatalf("want 1 instance with 2 rules, got instances=%d rules=%d", len(got), len(got[0].rules))
+	}
+	if !got[0].rules[0].SyncResponse {
+		t.Errorf("rule 0 SyncResponse should be true")
+	}
+	if got[0].rules[1].SyncResponse {
+		t.Errorf("rule 1 SyncResponse should default to false")
+	}
+}
+
 func TestParseYAMLTargetsSkipsInvalidIgnoreRules(t *testing.T) {
 	yaml := `
 - target: http://example.com

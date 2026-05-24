@@ -43,9 +43,28 @@ type Interaction struct {
 }
 
 // HTTPExchange pairs one request with the response it produced.
+//
+// Match carries optional per-exchange metadata produced by the matcher's
+// ignore rules — currently the literal substrings each sync_response rule
+// captured from the request, so replay can swap them back into the response
+// for the live request's equivalent values.
 type HTTPExchange struct {
 	Request  HTTPRequest  `json:"request"`
 	Response HTTPResponse `json:"response"`
+	Match    *MatchMeta   `json:"match,omitempty"`
+}
+
+// MatchMeta is the recorded side-information from matching rules.
+type MatchMeta struct {
+	Captures []Capture `json:"captures,omitempty"`
+}
+
+// Capture is one literal substring that a sync_response rule extracted from
+// the request at record time. Pattern is the rule's regex source — kept so a
+// replay can locate the right capture even if rule order changes in config.
+type Capture struct {
+	Pattern  string `json:"pattern"`
+	Captured string `json:"captured"`
 }
 
 // HTTPRequest captures the parts of a request used for matching.

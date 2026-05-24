@@ -26,17 +26,27 @@ func fmtDur(d time.Duration) string {
 // handlers can append interactions concurrently. The cassette is flushed to
 // disk after every append so a crashed test session still leaves a usable
 // (partial) recording behind.
+//
+// Rules are stored alongside the recorder so the HTTP handler can extract
+// sync_response captures at record time without an extra plumbing argument.
 type Recorder struct {
 	mu       sync.Mutex
 	cassette *cassette.Cassette
 	path     string
+	rules    []matcher.IgnoreRule
 }
 
-func NewRecorder(path string) *Recorder {
+func NewRecorder(path string, rules ...matcher.IgnoreRule) *Recorder {
 	return &Recorder{
 		cassette: &cassette.Cassette{Version: cassette.CurrentVersion},
 		path:     path,
+		rules:    rules,
 	}
+}
+
+// Rules exposes the configured ignore rules for the HTTP handler to consult.
+func (r *Recorder) Rules() []matcher.IgnoreRule {
+	return r.rules
 }
 
 // Append adds an interaction and flushes. Errors during flush are returned but
@@ -53,12 +63,12 @@ func (r *Recorder) Append(it cassette.Interaction) error {
 // If the file does not exist yet, an empty cassette is used. The returned
 // cassette snapshot can be handed to matcher.New so the auto handler can
 // match against already-recorded interactions.
-func NewAutoRecorder(path string) (*Recorder, *cassette.Cassette) {
+func NewAutoRecorder(path string, rules ...matcher.IgnoreRule) (*Recorder, *cassette.Cassette) {
 	c, err := cassette.Load(path)
 	if err != nil {
 		c = &cassette.Cassette{Version: cassette.CurrentVersion}
 	}
-	return &Recorder{cassette: c, path: path}, c
+	return &Recorder{cassette: c, path: path, rules: rules}, c
 }
 
 // AutoHandler is the record-on-miss handler: it serves from the cassette when
@@ -85,34 +95,43 @@ func AutoHandler(target *url.URL, rec *Recorder, m *matcher.Matcher) http.Handle
 		}
 
 		// Cache hit — replay from cassette.
-		for k, vs := range ex.Response.Headers {
-			for _, v := range vs {
-				w.Header().Add(k, v)
-			}
-		}
-		w.WriteHeader(ex.Response.Status)
-		flusher, _ := w.(http.Flusher)
-
-		if len(ex.Response.BodyChunks) > 0 {
-			for _, c := range ex.Response.BodyChunks {
-				if c.DelayMs > 0 {
-					time.Sleep(time.Duration(c.DelayMs) * time.Millisecond)
-				}
-				if _, werr := w.Write([]byte(c.Data)); werr != nil {
-					return
-				}
-				if flusher != nil {
-					flusher.Flush()
-				}
-			}
-		} else {
-			_, _ = w.Write([]byte(ex.Response.Body))
-		}
-		slog.Info(r.Method+" "+r.URL.Path,
-			"status", ex.Response.Status,
-			"dur", fmtDur(time.Since(start)),
-			"src", "cassette")
+		writeReplay(w, r, ex, m.Rules(), string(body), start)
 	})
+}
+
+// writeReplay emits a recorded HTTPExchange as the response, applying
+// sync_response substitutions so values like run IDs match the live request
+// instead of the value that was on the wire at record time.
+func writeReplay(w http.ResponseWriter, r *http.Request, ex *cassette.HTTPExchange, rules []matcher.IgnoreRule, liveBody string, start time.Time) {
+	repls := matcher.ComputeSyncReplacements(rules, r.Method, r.URL.Path, liveBody, ex)
+
+	for k, vs := range ex.Response.Headers {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(ex.Response.Status)
+	flusher, _ := w.(http.Flusher)
+
+	if len(ex.Response.BodyChunks) > 0 {
+		for _, c := range ex.Response.BodyChunks {
+			if c.DelayMs > 0 {
+				time.Sleep(time.Duration(c.DelayMs) * time.Millisecond)
+			}
+			if _, werr := w.Write([]byte(matcher.ApplyReplacements(c.Data, repls))); werr != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	} else {
+		_, _ = w.Write([]byte(matcher.ApplyReplacements(ex.Response.Body, repls)))
+	}
+	slog.Info(r.Method+" "+r.URL.Path,
+		"status", ex.Response.Status,
+		"dur", fmtDur(time.Since(start)),
+		"src", "cassette")
 }
 
 // RecordHandler returns an http.Handler that proxies every request to `target`
@@ -197,19 +216,20 @@ func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 			recordedResp.Body = string(full)
 		}
 
-		if appendErr := rec.Append(cassette.Interaction{
-			Type: "http",
-			HTTP: &cassette.HTTPExchange{
-				Request: cassette.HTTPRequest{
-					Method:  r.Method,
-					Path:    r.URL.Path,
-					Query:   r.URL.RawQuery,
-					Headers: filterHeaders(r.Header),
-					Body:    string(body),
-				},
-				Response: recordedResp,
+		exch := &cassette.HTTPExchange{
+			Request: cassette.HTTPRequest{
+				Method:  r.Method,
+				Path:    r.URL.Path,
+				Query:   r.URL.RawQuery,
+				Headers: filterHeaders(r.Header),
+				Body:    string(body),
 			},
-		}); appendErr != nil {
+			Response: recordedResp,
+		}
+		if caps := matcher.ExtractCaptures(rec.Rules(), r.Method, r.URL.Path, string(body)); len(caps) > 0 {
+			exch.Match = &cassette.MatchMeta{Captures: caps}
+		}
+		if appendErr := rec.Append(cassette.Interaction{Type: "http", HTTP: exch}); appendErr != nil {
 			slog.Warn("cassette write failed", "err", appendErr)
 		}
 
@@ -247,33 +267,7 @@ func ReplayHandler(m *matcher.Matcher) http.Handler {
 			return
 		}
 
-		for k, vs := range ex.Response.Headers {
-			for _, v := range vs {
-				w.Header().Add(k, v)
-			}
-		}
-		w.WriteHeader(ex.Response.Status)
-		flusher, _ := w.(http.Flusher)
-
-		if len(ex.Response.BodyChunks) > 0 {
-			for _, c := range ex.Response.BodyChunks {
-				if c.DelayMs > 0 {
-					time.Sleep(time.Duration(c.DelayMs) * time.Millisecond)
-				}
-				if _, werr := w.Write([]byte(c.Data)); werr != nil {
-					return
-				}
-				if flusher != nil {
-					flusher.Flush()
-				}
-			}
-		} else {
-			_, _ = w.Write([]byte(ex.Response.Body))
-		}
-		slog.Info(r.Method+" "+r.URL.Path,
-			"status", ex.Response.Status,
-			"dur", fmtDur(time.Since(start)),
-			"src", "cassette")
+		writeReplay(w, r, ex, m.Rules(), string(body), start)
 	})
 }
 
