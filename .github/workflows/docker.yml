@@ -16,6 +16,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # git describe needs the full tag history; default shallow clone hides
+          # tags and breaks the dev-version computation below.
+          fetch-depth: 0
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -31,6 +35,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # On main pushes, derive a semver-prerelease tag from the last v* tag so
+      # every main commit gets a versioned image (e.g. v0.5.1 + 3 commits →
+      # 0.5.1-dev.3.abc1234). Tag pushes skip this — the type=semver tags below
+      # cover the release case.
+      - name: Compute dev version
+        id: dev_version
+        if: github.ref == 'refs/heads/main'
+        run: |
+          desc=$(git describe --tags --long --match 'v*' 2>/dev/null || echo "")
+          if [ -z "$desc" ]; then
+            echo "version=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          count=$(echo "$desc" | sed -E 's/^v[0-9]+\.[0-9]+\.[0-9]+-([0-9]+)-g[0-9a-f]+$/\1/')
+          # main HEAD == a release tag: tag-push workflow already covers it.
+          if [ "$count" = "0" ]; then
+            echo "version=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version=$(echo "$desc" | sed -E 's/^v([0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)-g([0-9a-f]+)$/\1-dev.\2.\3/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -39,6 +65,8 @@ jobs:
           tags: |
             # latest on every push to main
             type=raw,value=latest,enable={{is_default_branch}}
+            # versioned dev tag for every main commit: 0.5.1-dev.3.abc1234
+            type=raw,value=${{ steps.dev_version.outputs.version }},enable=${{ github.ref == 'refs/heads/main' && steps.dev_version.outputs.version != '' }}
             # full semver on tags: v1.2.3 → 1.2.3
             type=semver,pattern={{version}}
             # major.minor shorthand: v1.2.3 → 1.2
