@@ -26,6 +26,8 @@ import (
 	"syscall"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"buffr/internal/cassette"
 	"buffr/internal/matcher"
 	"buffr/internal/proxy"
@@ -91,10 +93,16 @@ Environment variables (flags take precedence):
   BUFFR_PORT      local port (default 8080)
   BUFFR_CASSETTE  cassette file path (auto-generated from target host if omitted)
 
-Multi-instance (one process, many ports):
+Multi-instance — YAML list (recommended):
+  BUFFR_TARGETS='- target: https://api.openai.com
+    port: 8081
+  - target: https://api.anthropic.com
+    port: 8082'
+
+Multi-instance — indexed env vars (alternative):
   BUFFR_0_TARGET=https://api.openai.com   BUFFR_0_PORT=8081
   BUFFR_1_TARGET=https://api.anthropic.com BUFFR_1_PORT=8082
-  …  (BUFFR_N_CASSETTE and BUFFR_N_MODE are optional per instance)
+  (BUFFR_N_CASSETTE and BUFFR_N_MODE optional; indices must be contiguous from 0)
 
 Examples:
   buffr auto --target https://api.openai.com --port 8080
@@ -228,10 +236,66 @@ type instanceConfig struct {
 	cassette string
 }
 
-// loadInstances reads BUFFR_0_TARGET, BUFFR_1_TARGET, … from the environment
-// and returns one instanceConfig per indexed group found. Returns nil when no
-// indexed variables are set, signalling single-instance mode.
+// yamlInstance is the per-entry schema for BUFFR_TARGETS YAML.
+type yamlInstance struct {
+	Target   string `yaml:"target"`
+	Port     int    `yaml:"port"`
+	Cassette string `yaml:"cassette"`
+	Mode     string `yaml:"mode"`
+}
+
+// loadInstances resolves multi-instance config from the environment.
+// BUFFR_TARGETS (YAML list) takes precedence over BUFFR_0_TARGET / BUFFR_1_TARGET / … indexed vars.
 func loadInstances() []instanceConfig {
+	if raw := os.Getenv("BUFFR_TARGETS"); raw != "" {
+		return parseYAMLTargets(raw)
+	}
+	return parseIndexedTargets()
+}
+
+// parseYAMLTargets parses the value of BUFFR_TARGETS as a YAML list.
+//
+//	BUFFR_TARGETS: |
+//	  - target: https://api.openai.com
+//	    port: 8081
+//	  - target: https://api.anthropic.com
+//	    port: 8082
+//	    mode: replay
+//	    cassette: /data/anthropic.json
+func parseYAMLTargets(raw string) []instanceConfig {
+	var entries []yamlInstance
+	if err := yaml.Unmarshal([]byte(raw), &entries); err != nil {
+		slog.Error("failed to parse BUFFR_TARGETS", "err", err)
+		return nil
+	}
+	out := make([]instanceConfig, 0, len(entries))
+	for i, e := range entries {
+		u, err := url.Parse(e.Target)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			slog.Warn("invalid target in BUFFR_TARGETS, skipping", "index", i, "value", e.Target)
+			continue
+		}
+		mode := e.Mode
+		if mode == "" {
+			mode = "auto"
+		}
+		port := e.Port
+		if port == 0 {
+			port = 8080 + i
+		}
+		out = append(out, instanceConfig{
+			mode:     mode,
+			target:   u,
+			port:     port,
+			cassette: cassettePath(e.Cassette, u.Host),
+		})
+	}
+	return out
+}
+
+// parseIndexedTargets reads BUFFR_0_TARGET, BUFFR_1_TARGET, … until the first
+// missing index.
+func parseIndexedTargets() []instanceConfig {
 	var out []instanceConfig
 	for i := 0; ; i++ {
 		pfx := fmt.Sprintf("BUFFR_%d_", i)

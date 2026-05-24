@@ -38,17 +38,35 @@ docker run -e BUFFR_MODE=auto \
 
 ### Multiple APIs in one container
 
+Configure via `BUFFR_TARGETS` (YAML list — recommended) or indexed env vars.
+
+**YAML** (cleaner for many entries):
 ```sh
 docker run \
-  -e BUFFR_0_TARGET=https://api.openai.com    -e BUFFR_0_PORT=8081 \
-  -e BUFFR_1_TARGET=https://api.anthropic.com -e BUFFR_1_PORT=8082 \
-  -e BUFFR_2_TARGET=https://api.elevenlabs.io -e BUFFR_2_PORT=8083 \
+  -e BUFFR_TARGETS='
+    - target: https://api.openai.com
+      port: 8081
+    - target: https://api.anthropic.com
+      port: 8082
+    - target: https://api.elevenlabs.io
+      port: 8083
+  ' \
   -v ./cassettes:/data \
   -p 8081:8081 -p 8082:8082 -p 8083:8083 \
   ghcr.io/robinbially/buffr:latest
 ```
 
-Each instance gets its own port and cassette (`api.openai.com.json`, …). Add `BUFFR_N_*` groups indefinitely — indices must be contiguous starting at 0.
+**Indexed env vars** (alternative):
+```sh
+docker run \
+  -e BUFFR_0_TARGET=https://api.openai.com    -e BUFFR_0_PORT=8081 \
+  -e BUFFR_1_TARGET=https://api.anthropic.com -e BUFFR_1_PORT=8082 \
+  -v ./cassettes:/data \
+  -p 8081:8081 -p 8082:8082 \
+  ghcr.io/robinbially/buffr:latest
+```
+
+Each instance gets its own port and cassette (`api.openai.com.json`, …). `BUFFR_TARGETS` takes precedence over indexed vars if both are set. Per-instance `mode` and `cassette` fields are optional (default: `auto`, auto-named).
 
 ## Configuration
 
