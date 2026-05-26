@@ -30,10 +30,11 @@ func fmtDur(d time.Duration) string {
 // Rules are stored alongside the recorder so the HTTP handler can extract
 // sync_response captures at record time without an extra plumbing argument.
 type Recorder struct {
-	mu       sync.Mutex
-	cassette *cassette.Cassette
-	path     string
-	rules    []matcher.IgnoreRule
+	mu          sync.Mutex
+	cassette    *cassette.Cassette
+	path        string
+	rules       []matcher.IgnoreRule
+	subscribers []func(cassette.Interaction)
 }
 
 func NewRecorder(path string, rules ...matcher.IgnoreRule) *Recorder {
@@ -49,14 +50,29 @@ func (r *Recorder) Rules() []matcher.IgnoreRule {
 	return r.rules
 }
 
+// Subscribe registers a callback fired after each successful Append. The
+// auto handler uses this to feed fresh recordings back into the matcher pool
+// so a second identical request in the same session can replay instead of
+// re-recording.
+func (r *Recorder) Subscribe(fn func(cassette.Interaction)) {
+	r.mu.Lock()
+	r.subscribers = append(r.subscribers, fn)
+	r.mu.Unlock()
+}
+
 // Append adds an interaction and flushes. Errors during flush are returned but
 // not propagated to the HTTP client — the client doesn't care that we failed
 // to persist its traffic.
 func (r *Recorder) Append(it cassette.Interaction) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.cassette.Interactions = append(r.cassette.Interactions, it)
-	return cassette.Save(r.path, r.cassette)
+	subs := append([]func(cassette.Interaction){}, r.subscribers...)
+	err := cassette.Save(r.path, r.cassette)
+	r.mu.Unlock()
+	for _, fn := range subs {
+		fn(it)
+	}
+	return err
 }
 
 // NewAutoRecorder creates a Recorder pre-seeded from an existing cassette file.
@@ -76,6 +92,14 @@ func NewAutoRecorder(path string, rules ...matcher.IgnoreRule) (*Recorder, *cass
 // This lets tests run fully offline once every interaction has been captured,
 // while still accumulating new cassette entries transparently on first run.
 func AutoHandler(target *url.URL, rec *Recorder, m *matcher.Matcher) http.Handler {
+	// Feed every fresh recording back into the matcher's replay pool. Without
+	// this hook a long-running auto-mode proxy never replays anything recorded
+	// after startup, since matcher.New snapshots the cassette only once.
+	rec.Subscribe(func(it cassette.Interaction) {
+		if it.Type == "http" && it.HTTP != nil {
+			m.Add(it.HTTP)
+		}
+	})
 	record := RecordHandler(target, rec)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -93,6 +117,11 @@ func AutoHandler(target *url.URL, rec *Recorder, m *matcher.Matcher) http.Handle
 			record.ServeHTTP(w, r)
 			return
 		}
+
+		// Re-add so identical follow-up calls keep replaying. Auto mode treats
+		// the cassette as a cache; the popping semantic only applies to strict
+		// replay where each recorded exchange should serve exactly once.
+		m.Add(ex)
 
 		// Cache hit — replay from cassette.
 		writeReplay(w, r, ex, m.Rules(), string(body), start)

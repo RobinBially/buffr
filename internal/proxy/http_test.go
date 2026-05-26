@@ -264,6 +264,41 @@ func TestSyncResponseRewritesSSEChunks(t *testing.T) {
 	}
 }
 
+func TestAutoReplaysWithinSameSession(t *testing.T) {
+	// Regression: matcher.New snapshots the cassette at startup; freshly recorded
+	// exchanges have to be fed back into the pool, otherwise a second identical
+	// request in the same session goes upstream and the cassette grows duplicates
+	// forever. The hook lives in AutoHandler.
+	var upstreamHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"hit":` + strings.Repeat("x", 0) + `"upstream"}`))
+	}))
+	defer upstream.Close()
+
+	target, _ := url.Parse(upstream.URL)
+	path := filepath.Join(t.TempDir(), "cass.json")
+	rec, existing := NewAutoRecorder(path)
+	m := matcher.New(existing, matcher.JSONBodyNormalizer)
+	proxy := httptest.NewServer(AutoHandler(target, rec, m))
+	defer proxy.Close()
+
+	for i := 0; i < 3; i++ {
+		resp, err := http.Post(proxy.URL+"/v1/chat", "application/json", strings.NewReader(`{"prompt":"same"}`))
+		if err != nil {
+			t.Fatalf("POST #%d: %v", i, err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+
+	if upstreamHits != 1 {
+		t.Errorf("upstream hits: got %d, want 1 (first miss only; replays should follow)", upstreamHits)
+	}
+}
+
 func TestReplayMissReturns599(t *testing.T) {
 	c := &cassette.Cassette{}
 	m := matcher.New(c, nil)

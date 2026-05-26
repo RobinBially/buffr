@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
+	"sync"
 
 	"buffr/internal/cassette"
 )
@@ -69,6 +70,7 @@ type Normalizer func(method, path, body string) string
 type Matcher struct {
 	normalizer Normalizer
 	rules      []IgnoreRule
+	mu         sync.Mutex
 	pool       []*cassette.HTTPExchange
 }
 
@@ -95,6 +97,8 @@ func New(c *cassette.Cassette, normalizer Normalizer, rules ...IgnoreRule) *Matc
 // or nil if none matches. Subsequent calls will not see the popped entry.
 func (m *Matcher) Take(method, path, body string) *cassette.HTTPExchange {
 	wantSig := m.signature(method, path, body)
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for i, ex := range m.pool {
 		gotSig := m.signature(ex.Request.Method, ex.Request.Path, ex.Request.Body)
 		if gotSig == wantSig {
@@ -105,9 +109,24 @@ func (m *Matcher) Take(method, path, body string) *cassette.HTTPExchange {
 	return nil
 }
 
+// Add inserts a freshly recorded exchange into the replay pool so a subsequent
+// identical request in the same session can hit the cassette instead of going
+// upstream again. This is what makes `auto` mode self-healing within a single
+// run — without it, every duplicate call records a new copy.
+func (m *Matcher) Add(ex *cassette.HTTPExchange) {
+	if ex == nil {
+		return
+	}
+	m.mu.Lock()
+	m.pool = append(m.pool, ex)
+	m.mu.Unlock()
+}
+
 // Remaining returns how many recorded HTTP exchanges have not been taken yet.
 // Useful at the end of a test to assert the cassette was fully consumed.
 func (m *Matcher) Remaining() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return len(m.pool)
 }
 
