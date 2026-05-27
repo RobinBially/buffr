@@ -32,9 +32,10 @@ var upgrader = websocket.Upgrader{
 // exhausted. Matches the record-on-miss semantics of AutoHandler.
 func AutoWSHandler(target *url.URL, rec *Recorder, rep *wsReplayer) http.Handler {
 	record := RecordWSHandler(target, rec)
+	replay := ReplayWSHandler(rep)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if rep.Remaining() > 0 {
-			ReplayWSHandler(rep).ServeHTTP(w, r)
+		if rep.HasForPath(r.URL.Path) {
+			replay.ServeHTTP(w, r)
 			return
 		}
 		record.ServeHTTP(w, r)
@@ -195,14 +196,43 @@ func (r *wsReplayer) Remaining() int {
 	return len(r.sessions)
 }
 
-func (r *wsReplayer) take() *cassette.WSSession {
+// HasForPath reports whether takeForPath would return a session for path
+// (without consuming it). Used by the auto handler to decide replay vs record.
+func (r *wsReplayer) HasForPath(path string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(r.sessions) == 0 {
+	return r.indexForPath(path) >= 0
+}
+
+// indexForPath returns the index of the next session to serve for path, or -1.
+// Sessions are matched by request path first (FIFO within a path); a path-less
+// recorded session matches any path as a back-compat fallback. Matching by path
+// — not by global order — is what lets concurrent connections to different
+// endpoints (e.g. /v1/realtime and /v1/audio/diarize during audio processing)
+// each get their own recording instead of deadlocking on a swapped session.
+// Caller must hold r.mu.
+func (r *wsReplayer) indexForPath(path string) int {
+	fallback := -1
+	for i, s := range r.sessions {
+		if s.Request.Path == path {
+			return i
+		}
+		if fallback < 0 && s.Request.Path == "" {
+			fallback = i
+		}
+	}
+	return fallback
+}
+
+func (r *wsReplayer) takeForPath(path string) *cassette.WSSession {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	i := r.indexForPath(path)
+	if i < 0 {
 		return nil
 	}
-	s := r.sessions[0]
-	r.sessions = r.sessions[1:]
+	s := r.sessions[i]
+	r.sessions = append(r.sessions[:i], r.sessions[i+1:]...)
 	return s
 }
 
@@ -212,7 +242,7 @@ func (r *wsReplayer) take() *cassette.WSSession {
 func ReplayWSHandler(rep *wsReplayer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		session := rep.take()
+		session := rep.takeForPath(r.URL.Path)
 		if session == nil {
 			slog.Warn("WS "+r.URL.Path, "src", "miss")
 			http.Error(w, "buffr: no cassette ws session for "+r.URL.Path, 599)
