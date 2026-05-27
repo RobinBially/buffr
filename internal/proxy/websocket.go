@@ -267,7 +267,7 @@ func ReplayWSHandler(rep *wsReplayer) http.Handler {
 			f := session.Frames[cursor]
 			switch f.Direction {
 			case cassette.DirServerToClient:
-				if f.DelayMs > 0 {
+				if f.DelayMs > 0 && !replayNoDelay {
 					time.Sleep(time.Duration(f.DelayMs) * time.Millisecond)
 				}
 				msgType, payload, err := frameToMessage(f)
