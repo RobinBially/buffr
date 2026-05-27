@@ -134,6 +134,41 @@ func TestReplayWSHappyPath(t *testing.T) {
 	}
 }
 
+// TestReplayWSMatchesByPath guards the audio-processing case: recordings for
+// /realtime and /diarize live in one cassette, and the client may connect in a
+// different order than recorded. Each connection must get the session for its
+// own path — not whatever happens to be first — or the two sides deadlock.
+func TestReplayWSMatchesByPath(t *testing.T) {
+	c := &cassette.Cassette{Interactions: []cassette.Interaction{
+		{Type: "websocket", WebSocket: &cassette.WSSession{
+			Request: cassette.WSRequest{Path: "/realtime"},
+			Frames: []cassette.WSFrame{
+				{Direction: cassette.DirServerToClient, Opcode: cassette.OpText, Data: "session.created"},
+			},
+		}},
+		{Type: "websocket", WebSocket: &cassette.WSSession{
+			Request: cassette.WSRequest{Path: "/diarize"},
+			Frames: []cassette.WSFrame{
+				{Direction: cassette.DirClientToServer, Opcode: cassette.OpBinary, Data: "audio"},
+			},
+		}},
+	}}
+	rep := NewWSReplayer(c)
+	srv := httptest.NewServer(ReplayWSHandler(rep))
+	defer srv.Close()
+
+	// Connect to /realtime even though /diarize is the second recorded session.
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL)+"/realtime", nil)
+	if err != nil {
+		t.Fatalf("dial /realtime: %v", err)
+	}
+	defer conn.Close()
+	_, msg, err := conn.ReadMessage()
+	if err != nil || string(msg) != "session.created" {
+		t.Fatalf("expected session.created for /realtime, got %q err=%v", msg, err)
+	}
+}
+
 func TestReplayWSDriftClosesConnection(t *testing.T) {
 	c := &cassette.Cassette{Interactions: []cassette.Interaction{
 		{Type: "websocket", WebSocket: &cassette.WSSession{
