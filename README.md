@@ -96,6 +96,29 @@ docker run \
 
 `mode` and `cassette` are optional per entry — defaults to `auto` and `<host>.json`.
 
+## Replay speed (`BUFFR_REPLAY_NODELAY`)
+
+When recording, buffr captures the wall-clock delay before each streamed chunk
+(SSE) and WebSocket frame, and reproduces that cadence on replay — so a streamed
+response replays at its original speed. Faithful, but for test suites it means
+every replayed call re-spends the original generation time (often seconds each),
+which dominates total runtime.
+
+Set `BUFFR_REPLAY_NODELAY=1` to skip those recorded delays and emit all
+chunks/frames back-to-back. The payloads are identical; only the inter-chunk
+timing is dropped.
+
+```sh
+docker run \
+  -e BUFFR_REPLAY_NODELAY=1 \
+  -e BUFFR_TARGET=https://api.openai.com \
+  -v ./cassettes:/data \
+  -p 8080:8080 \
+  ghcr.io/robinbially/buffr:latest
+```
+
+Leave it unset (the default) when the streaming cadence itself is under test.
+
 ## Matching across non-deterministic requests
 
 Sometimes the request body or path contains per-run noise — a run ID, a UUID, a timestamp — that changes every invocation. Without help, no cassette entry ever matches a live request, and the cache hit rate collapses.

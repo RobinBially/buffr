@@ -8,12 +8,18 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"sync"
 	"time"
 
 	"buffr/internal/cassette"
 	"buffr/internal/matcher"
 )
+
+// replayNoDelay, when BUFFR_REPLAY_NODELAY=1, skips the recorded inter-chunk /
+// inter-frame delays on replay. Tests don't need the original streaming cadence,
+// and replaying it (per-chunk time.Sleep) dominates e2e runtime.
+var replayNoDelay = os.Getenv("BUFFR_REPLAY_NODELAY") == "1"
 
 func fmtDur(d time.Duration) string {
 	if d < time.Second {
@@ -144,7 +150,7 @@ func writeReplay(w http.ResponseWriter, r *http.Request, ex *cassette.HTTPExchan
 
 	if len(ex.Response.BodyChunks) > 0 {
 		for _, c := range ex.Response.BodyChunks {
-			if c.DelayMs > 0 {
+			if c.DelayMs > 0 && !replayNoDelay {
 				time.Sleep(time.Duration(c.DelayMs) * time.Millisecond)
 			}
 			if _, werr := w.Write([]byte(matcher.ApplyReplacements(c.Data, repls))); werr != nil {
