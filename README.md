@@ -173,9 +173,9 @@ All flags have environment variable equivalents; flags take precedence.
 
 <br />
 
-buffr records the wall-clock delay before each SSE chunk / WebSocket frame and reproduces that cadence on replay — faithful, but it re-spends the original generation time (often seconds per call) on every run.
+buffr records the wall-clock delay before each SSE chunk / WebSocket frame. By default these delays are dropped on replay so chunks/frames are emitted back-to-back — payloads are identical, only the inter-chunk timing is gone. This keeps replays fast instead of re-spending the original generation time (often seconds per call) on every run.
 
-Set `BUFFR_REPLAY_NODELAY=1` to emit all chunks/frames back-to-back. Payloads are identical; only the inter-chunk timing is dropped. Leave it unset when the streaming cadence itself is under test.
+Set `BUFFR_REPLAY_NODELAY=0` to reproduce the recorded cadence faithfully — do this when the streaming timing itself is under test.
 
 </details>
 
