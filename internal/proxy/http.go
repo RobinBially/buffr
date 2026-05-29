@@ -42,11 +42,13 @@ func matchHost(r *http.Request) string {
 	return ""
 }
 
-// ReplayNoDelay, when BUFFR_REPLAY_NODELAY=1, skips the recorded inter-chunk /
-// inter-frame delays on replay. Tests don't need the original streaming cadence,
-// and replaying it (per-chunk time.Sleep) dominates e2e runtime. Exported so it
-// can be toggled in tests; defaults from the env at startup.
-var ReplayNoDelay = os.Getenv("BUFFR_REPLAY_NODELAY") == "1"
+// ReplayNoDelay skips the recorded inter-chunk / inter-frame delays on replay.
+// Tests usually don't need the original streaming cadence, and replaying it
+// (per-chunk time.Sleep) dominates e2e runtime, so this defaults to on. Set
+// BUFFR_REPLAY_NODELAY=0 to restore the recorded cadence (e.g. when the
+// streaming timing itself is under test). Exported so it can be toggled in
+// tests; defaults from the env at startup.
+var ReplayNoDelay = os.Getenv("BUFFR_REPLAY_NODELAY") != "0"
 
 // EgressTransport is the RoundTripper used for upstream HTTP requests in
 // record/auto mode. It defaults to http.DefaultTransport (system-root TLS
