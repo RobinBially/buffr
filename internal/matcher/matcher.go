@@ -60,18 +60,34 @@ type SyncReplacement struct {
 // same output. Non-deterministic transforms (e.g. UUIDs) will defeat matching.
 type Normalizer func(method, path, body string) string
 
+// group holds every recorded exchange that shares a match key, in recorded
+// order, plus a cursor pointing at the next one to serve. The cursor wraps
+// modulo len(entries) so replay never runs off the end (see Take).
+type group struct {
+	entries []*cassette.HTTPExchange
+	cursor  int
+}
+
 // Matcher serves recorded responses for live requests.
 //
-// Each call to Take returns the response from the next matching interaction
-// and removes that interaction from the pool — so a cassette that recorded
-// two identical requests still replays them as two distinct responses, in
-// the order they were recorded. This matters for retry/loop scenarios where
-// the same prompt produces different completions across iterations.
+// Recorded exchanges are bucketed by match key. Each call to Take returns the
+// next exchange for the request's key and advances a per-key cursor that wraps
+// modulo the number of entries for that key:
+//
+//	served = entries[cursor % n]; cursor++
+//
+// Within a single run this disambiguates same-key duplicates in recorded order
+// — a cassette that recorded two identical requests replays them as two
+// distinct responses, which matters for retry/loop scenarios where the same
+// prompt produces different completions across iterations. Because the cursor
+// wraps instead of consuming, the same workload replayed again against the same
+// Matcher (a long-running buffr serving repeated test runs, no reload) starts a
+// fresh cycle and yields identical results — replay is idempotent across runs.
 type Matcher struct {
 	normalizer Normalizer
 	rules      []IgnoreRule
 	mu         sync.Mutex
-	pool       []*cassette.HTTPExchange
+	groups     map[string]*group
 }
 
 // New returns a Matcher seeded from the HTTP exchanges in `c`. Non-HTTP
@@ -84,17 +100,21 @@ func New(c *cassette.Cassette, normalizer Normalizer, rules ...IgnoreRule) *Matc
 	if normalizer == nil {
 		normalizer = ExactBodyNormalizer
 	}
-	m := &Matcher{normalizer: normalizer, rules: rules}
+	m := &Matcher{normalizer: normalizer, rules: rules, groups: map[string]*group{}}
 	for _, it := range c.Interactions {
 		if it.Type == "http" && it.HTTP != nil {
-			m.pool = append(m.pool, it.HTTP)
+			m.add(it.HTTP)
 		}
 	}
 	return m
 }
 
-// Take pops and returns the first cassette entry matching the live request,
-// or nil if none matches. Subsequent calls will not see the popped entry.
+// Take returns the next cassette entry matching the live request, or nil if no
+// entry shares its key. For a key with n recorded entries the i-th matching
+// call returns entry (i mod n) and advances the key's cursor — same-key
+// duplicates replay in recorded order, and the cursor wraps rather than
+// exhausting, so a repeated workload replays identically (idempotent across
+// runs without restart or reload).
 //
 // host distinguishes destinations in forward-proxy mode, where one cassette can
 // hold several hosts. Pass "" in reverse-proxy mode (the destination is implicit
@@ -104,17 +124,16 @@ func (m *Matcher) Take(method, host, path, body string) *cassette.HTTPExchange {
 	wantSig := m.signature(method, host, path, body)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for i, ex := range m.pool {
-		gotSig := m.signature(ex.Request.Method, ex.Request.Host, ex.Request.Path, ex.Request.Body)
-		if gotSig == wantSig {
-			m.pool = append(m.pool[:i], m.pool[i+1:]...)
-			return ex
-		}
+	g := m.groups[wantSig]
+	if g == nil || len(g.entries) == 0 {
+		return nil
 	}
-	return nil
+	ex := g.entries[g.cursor%len(g.entries)]
+	g.cursor++
+	return ex
 }
 
-// Add inserts a freshly recorded exchange into the replay pool so a subsequent
+// Add inserts a freshly recorded exchange into the replay groups so a subsequent
 // identical request in the same session can hit the cassette instead of going
 // upstream again. This is what makes `auto` mode self-healing within a single
 // run — without it, every duplicate call records a new copy.
@@ -123,16 +142,36 @@ func (m *Matcher) Add(ex *cassette.HTTPExchange) {
 		return
 	}
 	m.mu.Lock()
-	m.pool = append(m.pool, ex)
+	m.add(ex)
 	m.mu.Unlock()
 }
 
-// Remaining returns how many recorded HTTP exchanges have not been taken yet.
-// Useful at the end of a test to assert the cassette was fully consumed.
+// add buckets an exchange under its match key. Caller holds the lock (or is the
+// single-threaded New constructor).
+func (m *Matcher) add(ex *cassette.HTTPExchange) {
+	sig := m.signature(ex.Request.Method, ex.Request.Host, ex.Request.Path, ex.Request.Body)
+	g := m.groups[sig]
+	if g == nil {
+		g = &group{}
+		m.groups[sig] = g
+	}
+	g.entries = append(g.entries, ex)
+}
+
+// Remaining returns how many recorded HTTP exchanges have not yet been served
+// at least once. Because the cursor wraps, this floors at 0 once every entry in
+// a key's cycle has been served — useful at the end of a test to assert the
+// cassette was fully exercised.
 func (m *Matcher) Remaining() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return len(m.pool)
+	n := 0
+	for _, g := range m.groups {
+		if rem := len(g.entries) - g.cursor; rem > 0 {
+			n += rem
+		}
+	}
+	return n
 }
 
 // Rules exposes the rule list for callers that need to drive record-time
