@@ -2,6 +2,9 @@
 /dist/
 *.test
 *.out
+# forward-proxy CA generated on first run (default location is the data dir)
+buffr-ca.pem
+buffr-ca.key
 .DS_Store
 .idea/
 .vscode/

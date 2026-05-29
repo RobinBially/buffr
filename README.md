@@ -48,6 +48,8 @@ your app → buffr                    (every run after: replays from cassette)
 
 In `auto` mode buffr serves cached responses when it has them and falls back to the real API when it doesn't — the cassette fills itself up incrementally.
 
+Prefer not to wire a `base_url` per dependency? [Forward-proxy mode](#forward-proxy-mode-catch-all-no-per-host-wiring) intercepts **all** outbound HTTPS via `HTTPS_PROXY` + a trusted CA — a true catch-all recorder for hosts hardcoded inside libraries.
+
 ## Modes
 
 | Mode | Behaviour |
@@ -95,6 +97,67 @@ docker run \
 ```
 
 `mode` and `cassette` are optional per entry — defaults to `auto` and `<host>.json`.
+
+## Forward-proxy mode (catch-all, no per-host wiring)
+
+The reverse-proxy modes above need an explicit `--target` per upstream and the client must point a configurable `base_url` at buffr. That can't intercept hosts hardcoded inside a library — `huggingface.co` model downloads, vendor SDKs with fixed endpoints, `wss://…/v1/realtime`.
+
+**Forward-proxy mode** intercepts *everything* the client routes through it — like a transport-level recorder (VCR.py), but language-agnostic. The client sets the standard proxy env vars and trusts buffr's CA; buffr terminates TLS with on-the-fly leaf certs and records/replays per destination host. No `base_url` changes, no per-host config.
+
+```sh
+buffr proxy --auto --port 8080      # or --record / --replay
+buffr ca > buffr-ca.pem             # export the CA cert for the client to trust
+```
+
+The client side — no app code changes (`httpx`, `requests`, `aiohttp` all honor these):
+
+```sh
+export HTTPS_PROXY=http://buffr:8080
+export HTTP_PROXY=http://buffr:8080
+export NO_PROXY=localhost,127.0.0.1,database,qdrant,s3
+export SSL_CERT_FILE=/path/to/buffr-ca.pem        # httpx, requests, aiohttp
+export REQUESTS_CA_BUNDLE=/path/to/buffr-ca.pem    # requests / older stacks
+```
+
+buffr mints a root CA on first start and persists it (default `<data>/buffr-ca.pem` + `.key`), so the client trusts it once and every later run reuses it. HTTP, SSE, and WebSocket (`wss://`) are all intercepted; binary and gzip/br bodies are stored byte-faithfully.
+
+### `BUFFR_PROXY` — per-host config
+
+```yaml
+BUFFR_PROXY: |
+  mode: auto                       # auto | record | replay
+  bypass: [localhost, 127.0.0.1, database, qdrant, s3]   # tunneled, never recorded
+  hosts:
+    - host: inference-shared.homeport.ai
+      cassette: /data/vllm.json
+      match:
+        ignore:                    # same rules as reverse mode, per host
+          - in: request.body
+            pattern: 'chatcmpl-[A-Za-z0-9]{16,32}'
+            replace_with: '<CHATCMPL_ID>'
+            sync_response: true
+    - host: google.serper.dev
+      cassette: /data/serper.json
+    - host: '*'                    # fallback for any other host
+      cassette: /data/misc.json
+```
+
+- **`bypass`** — hosts (and their subdomains) tunneled straight through without TLS interception or recording, for infra/local services. The client's `NO_PROXY` is honored too.
+- **Unlisted hosts** fall back to the `'*'` entry, or — if there is none — record to `<data>/<host>.json`. Unlisted is *not* the same as bypassed.
+- Matching keys on **method + host + path + query + (normalized) body**, so a shared cassette never cross-matches between hosts, and N distinct requests to the same endpoint replay in recorded order.
+
+### Forward-proxy configuration
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `BUFFR_PROXY` | — | YAML: mode, bypass list, per-host cassette + `match.ignore` |
+| `BUFFR_CA_CERT` | `<data>/buffr-ca.pem` | CA cert path (also what `buffr ca` prints) |
+| `BUFFR_CA_KEY` | `<data>/buffr-ca.key` | CA private key path |
+| `BUFFR_DATA_DIR` | `.` | base dir for default cassettes + CA |
+
+### Known limitation
+
+Cert-pinned or HSTS-preloaded SDKs reject any MITM cert by design. Those dependencies can't use forward-proxy mode — keep them on the reverse-proxy `--target` / `base_url` wiring instead. `HTTP/2` clients are transparently downgraded to HTTP/1.1 on the intercepted leg (egress to the real upstream may still use h2).
 
 ## Replay speed (`BUFFR_REPLAY_NODELAY`)
 

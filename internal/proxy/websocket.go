@@ -27,6 +27,12 @@ var upgrader = websocket.Upgrader{
 	HandshakeTimeout: 30 * time.Second,
 }
 
+// EgressDialer dials upstream WebSocket connections in record/auto mode. It
+// defaults to gorilla's DefaultDialer (system-root TLS verification). Exported
+// so forward-proxy tests can trust a local wss test server; production should
+// leave it at the default.
+var EgressDialer = websocket.DefaultDialer
+
 // AutoWSHandler replays the next recorded WebSocket session when one is
 // available, and falls back to forwarding + recording when the cassette is
 // exhausted. Matches the record-on-miss semantics of AutoHandler.
@@ -34,7 +40,7 @@ func AutoWSHandler(target *url.URL, rec *Recorder, rep *wsReplayer) http.Handler
 	record := RecordWSHandler(target, rec)
 	replay := ReplayWSHandler(rep)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if rep.HasForPath(r.URL.Path) {
+		if rep.HasForPath(matchHost(r), r.URL.Path) {
 			replay.ServeHTTP(w, r)
 			return
 		}
@@ -67,7 +73,7 @@ func RecordWSHandler(target *url.URL, rec *Recorder) http.Handler {
 		upstreamHeader := http.Header{}
 		copyUpgradeHeaders(upstreamHeader, r.Header)
 
-		upConn, upResp, err := websocket.DefaultDialer.Dial(upstreamURL.String(), upstreamHeader)
+		upConn, upResp, err := EgressDialer.Dial(upstreamURL.String(), upstreamHeader)
 		if err != nil {
 			slog.Error("WS "+r.URL.Path, "err", err, "src", "upstream")
 			if upResp != nil {
@@ -85,6 +91,7 @@ func RecordWSHandler(target *url.URL, rec *Recorder) http.Handler {
 		session := &cassette.WSSession{
 			Request: cassette.WSRequest{
 				Path:    r.URL.Path,
+				Host:    matchHost(r),
 				Query:   r.URL.RawQuery,
 				Headers: filterHeaders(r.Header),
 			},
@@ -94,7 +101,9 @@ func RecordWSHandler(target *url.URL, rec *Recorder) http.Handler {
 			lastTS  = time.Now()
 			closeCh = make(chan struct{})
 			once    sync.Once
+			pumps   sync.WaitGroup
 		)
+		pumps.Add(2)
 		appendFrame := func(direction string, msgType int, payload []byte, closeCode int) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -117,6 +126,7 @@ func RecordWSHandler(target *url.URL, rec *Recorder) http.Handler {
 
 		// Client → Upstream pump
 		go func() {
+			defer pumps.Done()
 			defer closeOnce()
 			for {
 				msgType, payload, err := clientConn.ReadMessage()
@@ -137,6 +147,7 @@ func RecordWSHandler(target *url.URL, rec *Recorder) http.Handler {
 		// Upstream → Client pump (this goroutine "owns" the function lifetime
 		// so we can wait synchronously for either side to terminate).
 		go func() {
+			defer pumps.Done()
 			defer closeOnce()
 			for {
 				msgType, payload, err := upConn.ReadMessage()
@@ -155,6 +166,14 @@ func RecordWSHandler(target *url.URL, rec *Recorder) http.Handler {
 		}()
 
 		<-closeCh
+		// One pump has stopped; the other may still be blocked on ReadMessage.
+		// Close both conns so it returns promptly, then wait for both to finish
+		// before touching session.Frames — otherwise the still-running pump would
+		// append frames while rec.Append marshals the session (a data race).
+		_ = clientConn.Close()
+		_ = upConn.Close()
+		pumps.Wait()
+
 		if err := rec.Append(cassette.Interaction{Type: "websocket", WebSocket: session}); err != nil {
 			slog.Warn("WS cassette write failed", "path", r.URL.Path, "err", err)
 		}
@@ -196,24 +215,32 @@ func (r *wsReplayer) Remaining() int {
 	return len(r.sessions)
 }
 
-// HasForPath reports whether takeForPath would return a session for path
+// HasForPath reports whether takeForPath would return a session for host/path
 // (without consuming it). Used by the auto handler to decide replay vs record.
-func (r *wsReplayer) HasForPath(path string) bool {
+func (r *wsReplayer) HasForPath(host, path string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.indexForPath(path) >= 0
+	return r.indexForPath(host, path) >= 0
 }
 
-// indexForPath returns the index of the next session to serve for path, or -1.
-// Sessions are matched by request path first (FIFO within a path); a path-less
-// recorded session matches any path as a back-compat fallback. Matching by path
-// — not by global order — is what lets concurrent connections to different
-// endpoints (e.g. /v1/realtime and /v1/audio/diarize during audio processing)
-// each get their own recording instead of deadlocking on a swapped session.
-// Caller must hold r.mu.
-func (r *wsReplayer) indexForPath(path string) int {
+// indexForPath returns the index of the next session to serve for host/path, or
+// -1. Sessions are matched by request path first (FIFO within a path); a
+// path-less recorded session matches any path as a back-compat fallback.
+// Matching by path — not by global order — is what lets concurrent connections
+// to different endpoints (e.g. /v1/realtime and /v1/audio/diarize during audio
+// processing) each get their own recording instead of deadlocking on a swapped
+// session.
+//
+// host narrows matching in forward-proxy mode where one cassette may hold
+// sessions for several destinations. A non-empty live host only matches a
+// recorded session whose host is the same or empty (legacy/reverse recordings),
+// so reverse-mode behavior (host == "") is unchanged. Caller must hold r.mu.
+func (r *wsReplayer) indexForPath(host, path string) int {
 	fallback := -1
 	for i, s := range r.sessions {
+		if host != "" && s.Request.Host != "" && s.Request.Host != host {
+			continue
+		}
 		if s.Request.Path == path {
 			return i
 		}
@@ -224,10 +251,10 @@ func (r *wsReplayer) indexForPath(path string) int {
 	return fallback
 }
 
-func (r *wsReplayer) takeForPath(path string) *cassette.WSSession {
+func (r *wsReplayer) takeForPath(host, path string) *cassette.WSSession {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	i := r.indexForPath(path)
+	i := r.indexForPath(host, path)
 	if i < 0 {
 		return nil
 	}
@@ -242,7 +269,7 @@ func (r *wsReplayer) takeForPath(path string) *cassette.WSSession {
 func ReplayWSHandler(rep *wsReplayer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		session := rep.takeForPath(r.URL.Path)
+		session := rep.takeForPath(matchHost(r), r.URL.Path)
 		if session == nil {
 			slog.Warn("WS "+r.URL.Path, "src", "miss")
 			http.Error(w, "buffr: no cassette ws session for "+r.URL.Path, 599)
@@ -267,7 +294,7 @@ func ReplayWSHandler(rep *wsReplayer) http.Handler {
 			f := session.Frames[cursor]
 			switch f.Direction {
 			case cassette.DirServerToClient:
-				if f.DelayMs > 0 && !replayNoDelay {
+				if f.DelayMs > 0 && !ReplayNoDelay {
 					time.Sleep(time.Duration(f.DelayMs) * time.Millisecond)
 				}
 				msgType, payload, err := frameToMessage(f)
