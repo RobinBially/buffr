@@ -24,16 +24,58 @@ func TestMatchAndConsume(t *testing.T) {
 	}}
 	m := New(c, nil)
 
-	got := m.Take("POST", "/v1/chat", `{"prompt":"hi"}`)
+	got := m.Take("POST", "", "/v1/chat", `{"prompt":"hi"}`)
 	if got == nil || got.Response.Status != 200 {
 		t.Fatalf("first take should return status 200, got %+v", got)
 	}
-	got = m.Take("POST", "/v1/chat", `{"prompt":"hi"}`)
+	got = m.Take("POST", "", "/v1/chat", `{"prompt":"hi"}`)
 	if got == nil || got.Response.Status != 201 {
 		t.Fatalf("second take should return status 201, got %+v", got)
 	}
-	if m.Take("POST", "/v1/chat", `{"prompt":"hi"}`) != nil {
+	if m.Take("POST", "", "/v1/chat", `{"prompt":"hi"}`) != nil {
 		t.Fatalf("third take should return nil (pool exhausted)")
+	}
+}
+
+func exHost(method, host, path, body string, status int) cassette.Interaction {
+	return cassette.Interaction{
+		Type: "http",
+		HTTP: &cassette.HTTPExchange{
+			Request:  cassette.HTTPRequest{Method: method, Host: host, Path: path, Body: body},
+			Response: cassette.HTTPResponse{Status: status},
+		},
+	}
+}
+
+func TestEmptyHostHashesIdenticallyToLegacy(t *testing.T) {
+	// Back-compat: a cassette recorded before host-aware matching (Host == "")
+	// must still match a reverse-mode live request that also passes host "".
+	c := &cassette.Cassette{Interactions: []cassette.Interaction{
+		ex("POST", "/v1/chat", `{"p":1}`, 200),
+	}}
+	m := New(c, JSONBodyNormalizer)
+	if got := m.Take("POST", "", "/v1/chat", `{"p":1}`); got == nil {
+		t.Fatalf("empty-host live request must match a legacy host-less recording")
+	}
+}
+
+func TestDistinctHostsDoNotCollide(t *testing.T) {
+	// Same method+path+body to two different hosts (the shared-cassette case)
+	// must resolve to the right recording, not collide.
+	c := &cassette.Cassette{Interactions: []cassette.Interaction{
+		exHost("GET", "huggingface.co", "/ping", "", 200),
+		exHost("GET", "google.serper.dev", "/ping", "", 201),
+	}}
+	m := New(c, nil)
+	if got := m.Take("GET", "google.serper.dev", "/ping", ""); got == nil || got.Response.Status != 201 {
+		t.Fatalf("want serper (201), got %+v", got)
+	}
+	if got := m.Take("GET", "huggingface.co", "/ping", ""); got == nil || got.Response.Status != 200 {
+		t.Fatalf("want huggingface (200), got %+v", got)
+	}
+	// A third host with the same shape must miss entirely.
+	if got := m.Take("GET", "example.com", "/ping", ""); got != nil {
+		t.Fatalf("unrelated host must not match, got %+v", got)
 	}
 }
 
@@ -42,13 +84,13 @@ func TestNoMatch(t *testing.T) {
 		ex("POST", "/a", "body-a", 200),
 	}}
 	m := New(c, nil)
-	if m.Take("POST", "/b", "body-a") != nil {
+	if m.Take("POST", "", "/b", "body-a") != nil {
 		t.Errorf("path mismatch should not match")
 	}
-	if m.Take("GET", "/a", "body-a") != nil {
+	if m.Take("GET", "", "/a", "body-a") != nil {
 		t.Errorf("method mismatch should not match")
 	}
-	if m.Take("POST", "/a", "different") != nil {
+	if m.Take("POST", "", "/a", "different") != nil {
 		t.Errorf("body mismatch should not match")
 	}
 	if m.Remaining() != 1 {
@@ -61,7 +103,7 @@ func TestJSONNormalizerIgnoresKeyOrder(t *testing.T) {
 		ex("POST", "/x", `{"a":1,"b":2}`, 200),
 	}}
 	m := New(c, JSONBodyNormalizer)
-	if got := m.Take("POST", "/x", `{"b":2,"a":1}`); got == nil {
+	if got := m.Take("POST", "", "/x", `{"b":2,"a":1}`); got == nil {
 		t.Fatalf("JSON normalizer should match reordered keys")
 	}
 }
@@ -71,7 +113,7 @@ func TestJSONNormalizerFallsBackOnInvalidJSON(t *testing.T) {
 		ex("POST", "/x", "not json", 200),
 	}}
 	m := New(c, JSONBodyNormalizer)
-	if got := m.Take("POST", "/x", "not json"); got == nil {
+	if got := m.Take("POST", "", "/x", "not json"); got == nil {
 		t.Fatalf("non-JSON body should still match exactly")
 	}
 }
@@ -91,7 +133,7 @@ func TestIgnoreRuleBodyMatchesAcrossRuns(t *testing.T) {
 		ReplaceWith: "/runs/<RUN_ID>/",
 	}
 	m := New(c, JSONBodyNormalizer, rule)
-	if got := m.Take("POST", "/v1/chat", live); got == nil {
+	if got := m.Take("POST", "", "/v1/chat", live); got == nil {
 		t.Fatalf("rule should normalize per-run ID so live request matches recorded one")
 	}
 }
@@ -106,7 +148,7 @@ func TestIgnoreRulePathMatchesAcrossRuns(t *testing.T) {
 		ReplaceWith: "/runs/<RUN_ID>/",
 	}
 	m := New(c, nil, rule)
-	if got := m.Take("GET", "/v1/runs/20260524-093045-042/messages", ""); got == nil {
+	if got := m.Take("GET", "", "/v1/runs/20260524-093045-042/messages", ""); got == nil {
 		t.Fatalf("path rule should normalize per-run ID so live request matches recorded one")
 	}
 }
@@ -122,7 +164,7 @@ func TestIgnoreRuleDoesNotCrossPaths(t *testing.T) {
 		ReplaceWith: `"id":"<ID>"`,
 	}
 	m := New(c, JSONBodyNormalizer, rule)
-	if m.Take("POST", "/b", `{"id":"Y"}`) != nil {
+	if m.Take("POST", "", "/b", `{"id":"Y"}`) != nil {
 		t.Errorf("body rule must not paper over path mismatch")
 	}
 }

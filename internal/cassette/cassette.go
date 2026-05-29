@@ -15,9 +15,11 @@
 package cassette
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
+	"unicode/utf8"
 )
 
 // CurrentVersion is the schema version this package writes. Older cassettes
@@ -37,9 +39,9 @@ type Cassette struct {
 // chronological order intact, which matters when the same test makes a mix of
 // HTTP and WS calls in sequence.
 type Interaction struct {
-	Type      string         `json:"type"` // "http" or "websocket"
-	HTTP      *HTTPExchange  `json:"http,omitempty"`
-	WebSocket *WSSession     `json:"websocket,omitempty"`
+	Type      string        `json:"type"` // "http" or "websocket"
+	HTTP      *HTTPExchange `json:"http,omitempty"`
+	WebSocket *WSSession    `json:"websocket,omitempty"`
 }
 
 // HTTPExchange pairs one request with the response it produced.
@@ -74,8 +76,15 @@ type Capture struct {
 // and proxy-sensitive headers (Host, Connection, Authorization values) are
 // recorded as the client sent them so replay can verify drift, but matching
 // ignores them by default.
+//
+// Host is populated only in forward-proxy (MITM) mode, where a single cassette
+// may hold traffic for several destination hosts; it becomes part of the match
+// signature so requests to different hosts never collide. In reverse-proxy mode
+// the destination is implicit in the cassette/target, so Host is left empty and
+// contributes nothing to matching — keeping pre-existing cassettes compatible.
 type HTTPRequest struct {
 	Method  string              `json:"method"`
+	Host    string              `json:"host,omitempty"`
 	Path    string              `json:"path"`
 	Query   string              `json:"query,omitempty"`
 	Headers map[string][]string `json:"headers,omitempty"`
@@ -88,10 +97,16 @@ type HTTPRequest struct {
 // empty. For SSE / chunked responses, BodyChunks is non-empty and Body is
 // left blank; the replay path streams the chunks in order, honoring each
 // chunk's DelayMs from the previous chunk.
+//
+// When the body is not valid UTF-8 — gzip/br-compressed payloads, model files,
+// audio, any binary the forward proxy catches — it is stored base64-encoded in
+// BodyB64 and Body is left empty. Use EncodeBody/DecodeBody rather than reading
+// the fields directly so the UTF-8-vs-binary decision stays in one place.
 type HTTPResponse struct {
 	Status     int                 `json:"status"`
 	Headers    map[string][]string `json:"headers,omitempty"`
 	Body       string              `json:"body,omitempty"`
+	BodyB64    string              `json:"body_b64,omitempty"`
 	BodyChunks []Chunk             `json:"body_chunks,omitempty"`
 }
 
@@ -101,8 +116,13 @@ type HTTPResponse struct {
 // start of the response for the first chunk). Capturing the delay rather than
 // an absolute timestamp keeps cassettes diff-friendly when the wall clock of
 // the recording session is irrelevant.
+//
+// Like HTTPResponse.Body, a chunk whose payload is not valid UTF-8 is stored in
+// DataB64 with Data left empty. SSE chunks are text in practice; DataB64 covers
+// the rare binary chunked-transfer stream the forward proxy might intercept.
 type Chunk struct {
-	Data    string `json:"data"`
+	Data    string `json:"data,omitempty"`
+	DataB64 string `json:"data_b64,omitempty"`
 	DelayMs int    `json:"delay_ms"`
 }
 
@@ -113,8 +133,13 @@ type WSSession struct {
 }
 
 // WSRequest is the HTTP upgrade portion of the WebSocket handshake.
+//
+// Host, like HTTPRequest.Host, is populated only in forward-proxy mode so a
+// shared cassette can disambiguate sessions to different destinations; it is
+// empty (and ignored when matching) in reverse-proxy mode.
 type WSRequest struct {
 	Path    string              `json:"path"`
+	Host    string              `json:"host,omitempty"`
 	Query   string              `json:"query,omitempty"`
 	Headers map[string][]string `json:"headers,omitempty"`
 }
@@ -182,4 +207,37 @@ func Save(path string, c *Cassette) error {
 		return err
 	}
 	return os.WriteFile(path, data, 0o644)
+}
+
+// EncodeBody splits a raw body into the (plain, base64) pair the cassette
+// stores: valid UTF-8 goes to the plain string (human-readable in diffs), and
+// anything else is base64-encoded. Exactly one of the two return values is
+// non-empty for a non-empty input. Storing invalid UTF-8 in a JSON string would
+// silently corrupt it (encoding/json replaces bad bytes with U+FFFD), so binary
+// must take the base64 path.
+func EncodeBody(b []byte) (plain, b64 string) {
+	if len(b) == 0 {
+		return "", ""
+	}
+	if utf8.Valid(b) {
+		return string(b), ""
+	}
+	return "", base64.StdEncoding.EncodeToString(b)
+}
+
+// DecodeBody is the inverse of EncodeBody: it returns the raw bytes from
+// whichever field is populated. A malformed base64 string yields nil rather
+// than an error — a corrupt cassette should replay an empty body, not panic the
+// proxy mid-test.
+func DecodeBody(plain, b64 string) []byte {
+	if b64 != "" {
+		if raw, err := base64.StdEncoding.DecodeString(b64); err == nil {
+			return raw
+		}
+		return nil
+	}
+	if plain == "" {
+		return nil
+	}
+	return []byte(plain)
 }

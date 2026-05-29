@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -30,7 +31,9 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"buffr/internal/cassette"
+	"buffr/internal/forward"
 	"buffr/internal/matcher"
+	"buffr/internal/mitm"
 	"buffr/internal/proxy"
 )
 
@@ -51,6 +54,20 @@ func main() {
 		if mode := os.Getenv("BUFFR_MODE"); mode != "" {
 			args = []string{mode}
 		}
+	}
+
+	// Forward-proxy (TLS-MITM) mode and the `ca` helper are checked before the
+	// reverse-proxy multi-instance config so they take precedence when selected.
+	// `ca` just prints the CA cert; proxy mode is triggered by the `proxy`
+	// subcommand (incl. BUFFR_MODE=proxy, mapped above) or the BUFFR_PROXY env.
+	if len(args) > 0 && args[0] == "ca" {
+		os.Exit(runCA(args[1:]))
+	}
+	if len(args) > 0 && args[0] == "proxy" {
+		os.Exit(runProxy(args[1:]))
+	}
+	if os.Getenv("BUFFR_PROXY") != "" {
+		os.Exit(runProxy(nil))
 	}
 
 	// Multi-instance mode: BUFFR_TARGETS or BUFFR_0_TARGET take precedence
@@ -85,16 +102,35 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `buffr — record/replay HTTP + WebSocket proxy
 
-Usage:
+Usage (reverse proxy — point the client's base_url at buffr):
   buffr record  --target <url> [--port <p>] [--cassette <file>]
   buffr replay  [--cassette <file>] [--port <p>]
   buffr auto    --target <url> [--port <p>] [--cassette <file>]
 
+Usage (forward proxy — TLS-MITM, catch-all via HTTPS_PROXY):
+  buffr proxy   [--port <p>] [--record|--replay|--auto]
+  buffr ca      [--cert <file>] [--key <file>]   # print the CA cert PEM to trust
+
 Environment variables (flags take precedence):
-  BUFFR_MODE      subcommand (record|replay|auto) — used when no CLI argument is given
+  BUFFR_MODE      subcommand (record|replay|auto|proxy) — used when no CLI argument is given
   BUFFR_TARGET    upstream URL for record/auto mode
   BUFFR_PORT      local port (default 8080)
   BUFFR_CASSETTE  cassette file path (auto-generated from target host if omitted)
+
+Forward-proxy env:
+  BUFFR_PROXY     YAML config (mode, bypass list, per-host cassette + match.ignore)
+  BUFFR_CA_CERT   CA cert path (default <data>/buffr-ca.pem)
+  BUFFR_CA_KEY    CA key path  (default <data>/buffr-ca.key)
+  BUFFR_DATA_DIR  base dir for default cassettes + CA (default ".")
+  Client sets: HTTPS_PROXY=http://buffr:8080  SSL_CERT_FILE=<buffr-ca.pem>  NO_PROXY=...
+
+  BUFFR_PROXY: |
+    mode: auto
+    bypass: [localhost, 127.0.0.1, qdrant, s3]
+    hosts:
+      - host: huggingface.co
+        cassette: /data/hf.json
+      - host: '*'            # fallback for any other host
 
 Multi-instance — YAML list (recommended):
   BUFFR_TARGETS='- target: https://api.openai.com
@@ -161,7 +197,7 @@ func runRecord(args []string) int {
 	cassPath := cassettePath(*cass, u.Host)
 	rec := proxy.NewRecorder(cassPath)
 	mux := http.NewServeMux()
-	mux.Handle("/", routeUpgrade(
+	mux.Handle("/", proxy.RouteUpgrade(
 		proxy.RecordWSHandler(u, rec),
 		proxy.RecordHandler(u, rec),
 	))
@@ -185,25 +221,11 @@ func runReplay(args []string) int {
 	m := matcher.New(c, matcher.JSONBodyNormalizer)
 	rep := proxy.NewWSReplayer(c)
 	mux := http.NewServeMux()
-	mux.Handle("/", routeUpgrade(
+	mux.Handle("/", proxy.RouteUpgrade(
 		proxy.ReplayWSHandler(rep),
 		proxy.ReplayHandler(m),
 	))
 	return serve(*port, mux, "replay", *cass)
-}
-
-// routeUpgrade dispatches WebSocket upgrade requests to wsHandler and every
-// other request to httpHandler. The signal is the Upgrade header; relying on
-// it (rather than the path) means callers don't have to declare which paths
-// serve WS — the protocol tells us.
-func routeUpgrade(wsHandler, httpHandler http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-			wsHandler.ServeHTTP(w, r)
-			return
-		}
-		httpHandler.ServeHTTP(w, r)
-	})
 }
 
 // cassettePath returns path if non-empty, otherwise derives a filename from
@@ -235,11 +257,159 @@ func runAuto(args []string) int {
 	m := matcher.New(existing, matcher.JSONBodyNormalizer)
 	rep := proxy.NewWSReplayer(existing)
 	mux := http.NewServeMux()
-	mux.Handle("/", routeUpgrade(
+	mux.Handle("/", proxy.RouteUpgrade(
 		proxy.AutoWSHandler(u, rec, rep),
 		proxy.AutoHandler(u, rec, m),
 	))
 	return serve(*port, mux, "auto", cassPath)
+}
+
+// dataDir is the base directory for default cassettes and the CA files. In the
+// Docker image WORKDIR is /data, so the default "." resolves there.
+func dataDir() string { return envStr("BUFFR_DATA_DIR", ".") }
+
+func caCertPath() string { return envStr("BUFFR_CA_CERT", filepath.Join(dataDir(), "buffr-ca.pem")) }
+func caKeyPath() string  { return envStr("BUFFR_CA_KEY", filepath.Join(dataDir(), "buffr-ca.key")) }
+
+// yamlProxy is the schema for the BUFFR_PROXY env var (forward-proxy mode).
+type yamlProxy struct {
+	Mode   string          `yaml:"mode"`
+	Bypass []string        `yaml:"bypass"`
+	Hosts  []yamlProxyHost `yaml:"hosts"`
+}
+
+// yamlProxyHost configures one destination host. Host "*" is the catch-all
+// fallback for any host not listed explicitly.
+type yamlProxyHost struct {
+	Host     string     `yaml:"host"`
+	Cassette string     `yaml:"cassette"`
+	Match    *yamlMatch `yaml:"match,omitempty"`
+}
+
+// runCA prints the buffr root CA certificate (generating + persisting it if it
+// does not exist yet) so the client can trust it via SSL_CERT_FILE /
+// REQUESTS_CA_BUNDLE / the OS trust store.
+func runCA(args []string) int {
+	fs := flag.NewFlagSet("ca", flag.ExitOnError)
+	cert := fs.String("cert", caCertPath(), "CA cert path [BUFFR_CA_CERT]")
+	key := fs.String("key", caKeyPath(), "CA key path [BUFFR_CA_KEY]")
+	_ = fs.Parse(args)
+	ca, err := mitm.LoadOrCreateCA(*cert, *key)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ca: %v\n", err)
+		return 1
+	}
+	if _, err := os.Stdout.Write(ca.CertPEM()); err != nil {
+		return 1
+	}
+	return 0
+}
+
+// runProxy starts the forward-proxy (TLS-MITM) server.
+func runProxy(args []string) int {
+	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
+	port := fs.Int("port", envInt("BUFFR_PORT", 8080), "local port to listen on [BUFFR_PORT]")
+	record := fs.Bool("record", false, "force record mode (always egress + record)")
+	replay := fs.Bool("replay", false, "force replay mode (cassette only, miss → 599)")
+	auto := fs.Bool("auto", false, "force auto mode (replay on hit, record on miss) [default]")
+	_ = fs.Parse(args)
+
+	cfg := parseProxyConfig(os.Getenv("BUFFR_PROXY"))
+
+	// Mode precedence: explicit CLI flag > BUFFR_PROXY yaml `mode` > auto.
+	switch {
+	case *record:
+		cfg.Mode = "record"
+	case *replay:
+		cfg.Mode = "replay"
+	case *auto:
+		cfg.Mode = "auto"
+	}
+	if cfg.Mode == "" {
+		cfg.Mode = "auto"
+	}
+
+	ca, err := mitm.LoadOrCreateCA(caCertPath(), caKeyPath())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "proxy: failed to load/create CA: %v\n", err)
+		return 1
+	}
+	cfg.CA = ca
+	cfg.DataDir = dataDir()
+
+	// The client must trust this cert. Surface where it lives so the consumer
+	// can mount/point SSL_CERT_FILE at it (it is already written to disk by
+	// LoadOrCreateCA when freshly generated).
+	slog.Info("forward proxy CA ready", "cert", caCertPath(), "trust_via", "SSL_CERT_FILE / REQUESTS_CA_BUNDLE")
+
+	fwd := forward.New(cfg)
+	addr := fmt.Sprintf(":%d", *port)
+	srv := &http.Server{Addr: addr, Handler: fwd.Handler()}
+	go func() {
+		slog.Info("listening", "mode", "proxy:"+cfg.Mode, "addr", addr, "bypass", cfg.Bypass)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("server error", "err", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+	slog.Info("shutting down")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
+	return 0
+}
+
+// parseProxyConfig turns the BUFFR_PROXY YAML (plus the standard NO_PROXY env)
+// into a forward.Config. CA and DataDir are filled in by the caller.
+func parseProxyConfig(raw string) forward.Config {
+	var p yamlProxy
+	if raw != "" {
+		if err := yaml.Unmarshal([]byte(raw), &p); err != nil {
+			slog.Error("failed to parse BUFFR_PROXY", "err", err)
+		}
+	}
+
+	bypass := append([]string(nil), p.Bypass...)
+	// Honor the client's NO_PROXY too: clients usually skip the proxy for those
+	// hosts anyway, but if buffr still sees one it should tunnel, not record.
+	for _, key := range []string{"NO_PROXY", "no_proxy"} {
+		for _, h := range strings.Split(os.Getenv(key), ",") {
+			if h = strings.TrimSpace(h); h != "" {
+				bypass = append(bypass, h)
+			}
+		}
+	}
+
+	hosts := make([]forward.HostConfig, 0, len(p.Hosts))
+	for i, h := range p.Hosts {
+		if h.Host == "" {
+			slog.Warn("BUFFR_PROXY host entry missing host, skipping", "index", i)
+			continue
+		}
+		hosts = append(hosts, forward.HostConfig{
+			Host:     h.Host,
+			Cassette: proxyCassettePath(h.Cassette, h.Host),
+			Rules:    compileIgnoreRules(h.Match, i),
+		})
+	}
+
+	return forward.Config{Mode: p.Mode, Bypass: bypass, Hosts: hosts}
+}
+
+// proxyCassettePath resolves a host entry's cassette: the configured path, or a
+// default under the data dir ("misc.json" for the "*" fallback, "<host>.json"
+// otherwise).
+func proxyCassettePath(path, host string) string {
+	if path != "" {
+		return path
+	}
+	if host == "*" {
+		return filepath.Join(dataDir(), "misc.json")
+	}
+	return filepath.Join(dataDir(), host+".json")
 }
 
 // instanceConfig holds the parsed configuration for one proxy instance.
@@ -397,7 +567,7 @@ func runInstances(instances []instanceConfig) int {
 		case "record":
 			rec := proxy.NewRecorder(cfg.cassette, cfg.rules...)
 			mux = http.NewServeMux()
-			mux.Handle("/", routeUpgrade(
+			mux.Handle("/", proxy.RouteUpgrade(
 				proxy.RecordWSHandler(cfg.target, rec),
 				proxy.RecordHandler(cfg.target, rec),
 			))
@@ -410,7 +580,7 @@ func runInstances(instances []instanceConfig) int {
 			m := matcher.New(c, matcher.JSONBodyNormalizer, cfg.rules...)
 			rep := proxy.NewWSReplayer(c)
 			mux = http.NewServeMux()
-			mux.Handle("/", routeUpgrade(
+			mux.Handle("/", proxy.RouteUpgrade(
 				proxy.ReplayWSHandler(rep),
 				proxy.ReplayHandler(m),
 			))
@@ -419,7 +589,7 @@ func runInstances(instances []instanceConfig) int {
 			m := matcher.New(existing, matcher.JSONBodyNormalizer, cfg.rules...)
 			rep := proxy.NewWSReplayer(existing)
 			mux = http.NewServeMux()
-			mux.Handle("/", routeUpgrade(
+			mux.Handle("/", proxy.RouteUpgrade(
 				proxy.AutoWSHandler(cfg.target, rec, rep),
 				proxy.AutoHandler(cfg.target, rec, m),
 			))

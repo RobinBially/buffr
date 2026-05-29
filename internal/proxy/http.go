@@ -3,12 +3,14 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,10 +18,42 @@ import (
 	"buffr/internal/matcher"
 )
 
-// replayNoDelay, when BUFFR_REPLAY_NODELAY=1, skips the recorded inter-chunk /
+// matchHostKey carries the destination host through the request context in
+// forward-proxy (MITM) mode, where a single handler can serve many hosts. The
+// reverse-proxy paths never set it, so matchHost returns "" and matching/
+// recording behave exactly as before host-aware matching was added.
+type ctxKey int
+
+const matchHostKey ctxKey = iota
+
+// WithMatchHost tags a request context with the destination host so the shared
+// record/replay handlers fold it into the cassette match key. The forward proxy
+// sets this before dispatching an intercepted request to a per-host handler.
+func WithMatchHost(ctx context.Context, host string) context.Context {
+	return context.WithValue(ctx, matchHostKey, host)
+}
+
+// matchHost returns the destination host previously stored by WithMatchHost, or
+// "" when none was set (reverse-proxy mode).
+func matchHost(r *http.Request) string {
+	if h, ok := r.Context().Value(matchHostKey).(string); ok {
+		return h
+	}
+	return ""
+}
+
+// ReplayNoDelay, when BUFFR_REPLAY_NODELAY=1, skips the recorded inter-chunk /
 // inter-frame delays on replay. Tests don't need the original streaming cadence,
-// and replaying it (per-chunk time.Sleep) dominates e2e runtime.
-var replayNoDelay = os.Getenv("BUFFR_REPLAY_NODELAY") == "1"
+// and replaying it (per-chunk time.Sleep) dominates e2e runtime. Exported so it
+// can be toggled in tests; defaults from the env at startup.
+var ReplayNoDelay = os.Getenv("BUFFR_REPLAY_NODELAY") == "1"
+
+// EgressTransport is the RoundTripper used for upstream HTTP requests in
+// record/auto mode. It defaults to http.DefaultTransport (system-root TLS
+// verification, which is what real upstreams need). It is exported so
+// forward-proxy tests can point egress at a local test server; production code
+// should leave it at the default.
+var EgressTransport http.RoundTripper = http.DefaultTransport
 
 func fmtDur(d time.Duration) string {
 	if d < time.Second {
@@ -116,7 +150,7 @@ func AutoHandler(target *url.URL, rec *Recorder, m *matcher.Matcher) http.Handle
 		}
 		r.Body.Close()
 
-		ex := m.Take(r.Method, r.URL.Path, string(body))
+		ex := m.Take(r.Method, matchHost(r), r.URL.Path, string(body))
 		if ex == nil {
 			// Cache miss — RecordHandler logs this as src=upstream.
 			r.Body = io.NopCloser(bytes.NewReader(body))
@@ -150,10 +184,16 @@ func writeReplay(w http.ResponseWriter, r *http.Request, ex *cassette.HTTPExchan
 
 	if len(ex.Response.BodyChunks) > 0 {
 		for _, c := range ex.Response.BodyChunks {
-			if c.DelayMs > 0 && !replayNoDelay {
+			if c.DelayMs > 0 && !ReplayNoDelay {
 				time.Sleep(time.Duration(c.DelayMs) * time.Millisecond)
 			}
-			if _, werr := w.Write([]byte(matcher.ApplyReplacements(c.Data, repls))); werr != nil {
+			chunk := cassette.DecodeBody(c.Data, c.DataB64)
+			// sync_response substitutions only apply to text chunks; a binary
+			// chunk (stored via DataB64) is replayed byte-for-byte.
+			if c.DataB64 == "" {
+				chunk = []byte(matcher.ApplyReplacements(string(chunk), repls))
+			}
+			if _, werr := w.Write(chunk); werr != nil {
 				return
 			}
 			if flusher != nil {
@@ -161,12 +201,31 @@ func writeReplay(w http.ResponseWriter, r *http.Request, ex *cassette.HTTPExchan
 			}
 		}
 	} else {
-		_, _ = w.Write([]byte(matcher.ApplyReplacements(ex.Response.Body, repls)))
+		full := cassette.DecodeBody(ex.Response.Body, ex.Response.BodyB64)
+		if ex.Response.BodyB64 == "" {
+			full = []byte(matcher.ApplyReplacements(string(full), repls))
+		}
+		_, _ = w.Write(full)
 	}
 	slog.Info(r.Method+" "+r.URL.Path,
 		"status", ex.Response.Status,
 		"dur", fmtDur(time.Since(start)),
 		"src", "cassette")
+}
+
+// RouteUpgrade dispatches WebSocket upgrade requests to wsHandler and every
+// other request to httpHandler. The signal is the Upgrade header; relying on it
+// (rather than the path) means callers don't have to declare which paths serve
+// WS — the protocol tells us. Shared by the reverse-proxy entrypoint and the
+// forward proxy's per-host handlers.
+func RouteUpgrade(wsHandler, httpHandler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			wsHandler.ServeHTTP(w, r)
+			return
+		}
+		httpHandler.ServeHTTP(w, r)
+	})
 }
 
 // RecordHandler returns an http.Handler that proxies every request to `target`
@@ -200,7 +259,7 @@ func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 		}
 		copyHeadersExceptHopByHop(upReq.Header, r.Header)
 
-		resp, err := http.DefaultTransport.RoundTrip(upReq)
+		resp, err := EgressTransport.RoundTrip(upReq)
 		if err != nil {
 			slog.Error(r.Method+" "+r.URL.Path, "err", err, "src", "upstream")
 			http.Error(w, "buffr: upstream request failed: "+err.Error(), http.StatusBadGateway)
@@ -231,8 +290,10 @@ func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 						flusher.Flush()
 					}
 					now := time.Now()
+					data, b64 := cassette.EncodeBody(chunk)
 					recordedResp.BodyChunks = append(recordedResp.BodyChunks, cassette.Chunk{
-						Data:    string(chunk),
+						Data:    data,
+						DataB64: b64,
 						DelayMs: int(now.Sub(lastChunkAt) / time.Millisecond),
 					})
 					lastChunkAt = now
@@ -241,19 +302,28 @@ func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 					break
 				}
 			}
-		} else {
+		}
+
+		var fullBody []byte
+		if !isSSE {
 			full, readErr := io.ReadAll(resp.Body)
 			if readErr != nil && readErr != io.EOF {
 				slog.Error("upstream body read failed", "err", readErr)
 				http.Error(w, "buffr: upstream body read failed: "+readErr.Error(), http.StatusBadGateway)
 				return
 			}
-			recordedResp.Body = string(full)
+			fullBody = full
+			// Store the body verbatim: valid UTF-8 in Body, anything else
+			// (gzip/br/binary the catch-all proxy sees) base64 in BodyB64. The
+			// original Content-Encoding header is preserved, so replay is
+			// byte-faithful without buffr having to decompress anything.
+			recordedResp.Body, recordedResp.BodyB64 = cassette.EncodeBody(full)
 		}
 
 		exch := &cassette.HTTPExchange{
 			Request: cassette.HTTPRequest{
 				Method:  r.Method,
+				Host:    matchHost(r),
 				Path:    r.URL.Path,
 				Query:   r.URL.RawQuery,
 				Headers: filterHeaders(r.Header),
@@ -276,7 +346,7 @@ func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 		if !isSSE {
 			copyHeadersExceptHopByHop(w.Header(), resp.Header)
 			w.WriteHeader(resp.StatusCode)
-			_, _ = w.Write([]byte(recordedResp.Body))
+			_, _ = w.Write(fullBody)
 		}
 	})
 }
@@ -295,7 +365,7 @@ func ReplayHandler(m *matcher.Matcher) http.Handler {
 		}
 		r.Body.Close()
 
-		ex := m.Take(r.Method, r.URL.Path, string(body))
+		ex := m.Take(r.Method, matchHost(r), r.URL.Path, string(body))
 		if ex == nil {
 			slog.Warn(r.Method+" "+r.URL.Path, "src", "miss")
 			http.Error(w, fmt.Sprintf("buffr: no cassette match for %s %s", r.Method, r.URL.Path), 599)

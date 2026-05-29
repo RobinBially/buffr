@@ -95,12 +95,17 @@ func New(c *cassette.Cassette, normalizer Normalizer, rules ...IgnoreRule) *Matc
 
 // Take pops and returns the first cassette entry matching the live request,
 // or nil if none matches. Subsequent calls will not see the popped entry.
-func (m *Matcher) Take(method, path, body string) *cassette.HTTPExchange {
-	wantSig := m.signature(method, path, body)
+//
+// host distinguishes destinations in forward-proxy mode, where one cassette can
+// hold several hosts. Pass "" in reverse-proxy mode (the destination is implicit
+// in the cassette); an empty host contributes nothing to the signature, so
+// pre-existing cassettes hash and match exactly as before.
+func (m *Matcher) Take(method, host, path, body string) *cassette.HTTPExchange {
+	wantSig := m.signature(method, host, path, body)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for i, ex := range m.pool {
-		gotSig := m.signature(ex.Request.Method, ex.Request.Path, ex.Request.Body)
+		gotSig := m.signature(ex.Request.Method, ex.Request.Host, ex.Request.Path, ex.Request.Body)
 		if gotSig == wantSig {
 			m.pool = append(m.pool[:i], m.pool[i+1:]...)
 			return ex
@@ -232,7 +237,7 @@ func findCapture(caps []cassette.Capture, pattern string) string {
 	return ""
 }
 
-func (m *Matcher) signature(method, path, body string) string {
+func (m *Matcher) signature(method, host, path, body string) string {
 	for _, r := range m.rules {
 		switch r.In {
 		case IgnoreInBody:
@@ -245,6 +250,13 @@ func (m *Matcher) signature(method, path, body string) string {
 	h := sha256.New()
 	h.Write([]byte(method))
 	h.Write([]byte{0})
+	// Only fold host into the hash when present so reverse-mode signatures
+	// (host == "") stay byte-identical to those of cassettes recorded before
+	// host-aware matching existed.
+	if host != "" {
+		h.Write([]byte(host))
+		h.Write([]byte{0})
+	}
 	h.Write([]byte(path))
 	h.Write([]byte{0})
 	h.Write([]byte(normalized))
