@@ -196,6 +196,121 @@ func TestReplayWSDriftClosesConnection(t *testing.T) {
 	}
 }
 
+// TestReplayWSRepeatableAcrossRuns is the WS analogue of acceptance criterion
+// #1: connecting to the same recorded path repeatedly against the same running
+// replayer must keep replaying the session, not 599 after the first connection.
+func TestReplayWSRepeatableAcrossRuns(t *testing.T) {
+	c := &cassette.Cassette{Interactions: []cassette.Interaction{
+		{Type: "websocket", WebSocket: &cassette.WSSession{
+			Request: cassette.WSRequest{Path: "/realtime"},
+			Frames: []cassette.WSFrame{
+				{Direction: cassette.DirServerToClient, Opcode: cassette.OpText, Data: "hello"},
+			},
+		}},
+	}}
+	rep := NewWSReplayer(c)
+	srv := httptest.NewServer(ReplayWSHandler(rep))
+	defer srv.Close()
+
+	for run := 1; run <= 3; run++ {
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL)+"/realtime", nil)
+		if err != nil {
+			t.Fatalf("run %d dial: %v", run, err)
+		}
+		_, msg, err := conn.ReadMessage()
+		if err != nil || string(msg) != "hello" {
+			t.Fatalf("run %d greeting: %q err=%v", run, msg, err)
+		}
+		conn.Close()
+	}
+}
+
+// TestReplayWSDisambiguatesSamePathByQuery guards the tie-breaker: two sessions
+// recorded on the same path but with different handshake queries (the
+// wss://…/v1/realtime?model=A vs ?model=B case) must each be served to the
+// connection that asked for them, regardless of connection order — not just the
+// next one in recorded order. Repeated across runs to prove idempotency.
+func TestReplayWSDisambiguatesSamePathByQuery(t *testing.T) {
+	c := &cassette.Cassette{Interactions: []cassette.Interaction{
+		{Type: "websocket", WebSocket: &cassette.WSSession{
+			Request: cassette.WSRequest{Path: "/v1/realtime", Query: "model=A"},
+			Frames:  []cassette.WSFrame{{Direction: cassette.DirServerToClient, Opcode: cassette.OpText, Data: "from-A"}},
+		}},
+		{Type: "websocket", WebSocket: &cassette.WSSession{
+			Request: cassette.WSRequest{Path: "/v1/realtime", Query: "model=B"},
+			Frames:  []cassette.WSFrame{{Direction: cassette.DirServerToClient, Opcode: cassette.OpText, Data: "from-B"}},
+		}},
+	}}
+	rep := NewWSReplayer(c)
+	srv := httptest.NewServer(ReplayWSHandler(rep))
+	defer srv.Close()
+
+	greeting := func(query string) string {
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL)+"/v1/realtime?"+query, nil)
+		if err != nil {
+			t.Fatalf("dial %s: %v", query, err)
+		}
+		defer conn.Close()
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read %s: %v", query, err)
+		}
+		return string(msg)
+	}
+
+	for run := 1; run <= 3; run++ {
+		// Connect B before A — recorded order is A then B — to prove the query,
+		// not arrival order, selects the session.
+		if got := greeting("model=B"); got != "from-B" {
+			t.Fatalf("run %d: model=B got %q, want from-B", run, got)
+		}
+		if got := greeting("model=A"); got != "from-A" {
+			t.Fatalf("run %d: model=A got %q, want from-A", run, got)
+		}
+	}
+}
+
+// TestReplayWSSamePathSameQueryKeepsOrder guards that the query tie-breaker does
+// not disturb genuine same-key duplicates: two sessions on one path with the
+// same (here empty) query still replay in recorded order and wrap idempotently.
+func TestReplayWSSamePathSameQueryKeepsOrder(t *testing.T) {
+	c := &cassette.Cassette{Interactions: []cassette.Interaction{
+		{Type: "websocket", WebSocket: &cassette.WSSession{
+			Request: cassette.WSRequest{Path: "/stream"},
+			Frames:  []cassette.WSFrame{{Direction: cassette.DirServerToClient, Opcode: cassette.OpText, Data: "first"}},
+		}},
+		{Type: "websocket", WebSocket: &cassette.WSSession{
+			Request: cassette.WSRequest{Path: "/stream"},
+			Frames:  []cassette.WSFrame{{Direction: cassette.DirServerToClient, Opcode: cassette.OpText, Data: "second"}},
+		}},
+	}}
+	rep := NewWSReplayer(c)
+	srv := httptest.NewServer(ReplayWSHandler(rep))
+	defer srv.Close()
+
+	greet := func() string {
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL)+"/stream", nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		return string(msg)
+	}
+
+	for run := 1; run <= 2; run++ {
+		if got := greet(); got != "first" {
+			t.Fatalf("run %d call 1: got %q, want first", run, got)
+		}
+		if got := greet(); got != "second" {
+			t.Fatalf("run %d call 2: got %q, want second", run, got)
+		}
+	}
+}
+
 func TestReplayWSMissReturns599(t *testing.T) {
 	rep := NewWSReplayer(&cassette.Cassette{})
 	srv := httptest.NewServer(ReplayWSHandler(rep))
