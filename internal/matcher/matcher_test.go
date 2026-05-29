@@ -17,7 +17,7 @@ func ex(method, path, body string, status int) cassette.Interaction {
 	}
 }
 
-func TestMatchAndConsume(t *testing.T) {
+func TestMatchInOrderAndWrap(t *testing.T) {
 	c := &cassette.Cassette{Interactions: []cassette.Interaction{
 		ex("POST", "/v1/chat", `{"prompt":"hi"}`, 200),
 		ex("POST", "/v1/chat", `{"prompt":"hi"}`, 201), // duplicate request, different response
@@ -32,8 +32,38 @@ func TestMatchAndConsume(t *testing.T) {
 	if got == nil || got.Response.Status != 201 {
 		t.Fatalf("second take should return status 201, got %+v", got)
 	}
-	if m.Take("POST", "", "/v1/chat", `{"prompt":"hi"}`) != nil {
-		t.Fatalf("third take should return nil (pool exhausted)")
+	// The cursor wraps instead of exhausting: a third same-key take begins the
+	// cycle again rather than returning nil. This is what makes replay
+	// idempotent across repeated runs.
+	got = m.Take("POST", "", "/v1/chat", `{"prompt":"hi"}`)
+	if got == nil || got.Response.Status != 200 {
+		t.Fatalf("third take should wrap to status 200, got %+v", got)
+	}
+}
+
+func TestReplayRepeatableAcrossRuns(t *testing.T) {
+	// Regression for the v0.8.1 replay-repeatability bug. A cassette with
+	// same-key duplicates (a multi-step LLM pipeline records several
+	// POST /v1/responses that normalize to one key) must replay idempotently
+	// when the same workload is issued repeatedly against a long-running buffr
+	// — no restart, no cassette reload. Before the cyclic-cursor fix the
+	// per-key cursor consumed each entry once and ran off the end, so every
+	// same-key request 599'd from the second run onward.
+	c := &cassette.Cassette{Interactions: []cassette.Interaction{
+		ex("POST", "/v1/responses", `{"step":"x"}`, 200),
+		ex("POST", "/v1/responses", `{"step":"x"}`, 201),
+	}}
+	m := New(c, nil)
+
+	for run := 1; run <= 3; run++ {
+		got := m.Take("POST", "", "/v1/responses", `{"step":"x"}`)
+		if got == nil || got.Response.Status != 200 {
+			t.Fatalf("run %d, request 1: want status 200, got %+v", run, got)
+		}
+		got = m.Take("POST", "", "/v1/responses", `{"step":"x"}`)
+		if got == nil || got.Response.Status != 201 {
+			t.Fatalf("run %d, request 2: want status 201, got %+v", run, got)
+		}
 	}
 }
 

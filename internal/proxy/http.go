@@ -158,12 +158,9 @@ func AutoHandler(target *url.URL, rec *Recorder, m *matcher.Matcher) http.Handle
 			return
 		}
 
-		// Re-add so identical follow-up calls keep replaying. Auto mode treats
-		// the cassette as a cache; the popping semantic only applies to strict
-		// replay where each recorded exchange should serve exactly once.
-		m.Add(ex)
-
-		// Cache hit — replay from cassette.
+		// Cache hit — replay from cassette. Take advances a cyclic per-key
+		// cursor without consuming the entry, so identical follow-up calls keep
+		// replaying with no re-add needed.
 		writeReplay(w, r, ex, m.Rules(), string(body), start)
 	})
 }

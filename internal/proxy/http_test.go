@@ -123,6 +123,44 @@ func TestReplayPlainHTTP(t *testing.T) {
 	}
 }
 
+func TestReplayRepeatableSameKey(t *testing.T) {
+	// Acceptance criterion #1: replaying a cassette with same-key duplicates
+	// must be idempotent across runs. Issue the same two-call workload three
+	// times against the same running ReplayHandler (no reload) and assert every
+	// request matches the cassette — 0 misses, responses in recorded order each
+	// run.
+	c := &cassette.Cassette{Interactions: []cassette.Interaction{
+		{Type: "http", HTTP: &cassette.HTTPExchange{
+			Request:  cassette.HTTPRequest{Method: "POST", Path: "/v1/responses", Body: `{"step":"x"}`},
+			Response: cassette.HTTPResponse{Status: 200, Body: "first"},
+		}},
+		{Type: "http", HTTP: &cassette.HTTPExchange{
+			Request:  cassette.HTTPRequest{Method: "POST", Path: "/v1/responses", Body: `{"step":"x"}`},
+			Response: cassette.HTTPResponse{Status: 201, Body: "second"},
+		}},
+	}}
+	m := matcher.New(c, nil)
+	srv := httptest.NewServer(ReplayHandler(m))
+	defer srv.Close()
+
+	for run := 1; run <= 3; run++ {
+		for _, want := range []struct {
+			status int
+			body   string
+		}{{200, "first"}, {201, "second"}} {
+			resp, err := http.Post(srv.URL+"/v1/responses", "application/json", strings.NewReader(`{"step":"x"}`))
+			if err != nil {
+				t.Fatalf("run %d POST: %v", run, err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != want.status || string(body) != want.body {
+				t.Fatalf("run %d: got %d %q, want %d %q", run, resp.StatusCode, body, want.status, want.body)
+			}
+		}
+	}
+}
+
 func TestReplaySSE(t *testing.T) {
 	c := &cassette.Cassette{Interactions: []cassette.Interaction{
 		{Type: "http", HTTP: &cassette.HTTPExchange{
