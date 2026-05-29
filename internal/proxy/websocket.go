@@ -196,11 +196,12 @@ func RecordWSHandler(target *url.URL, rec *Recorder) http.Handler {
 type wsReplayer struct {
 	mu       sync.Mutex
 	sessions []*cassette.WSSession
+	cursor   map[string]int // live host\x00path -> next index within its candidate set
 }
 
 // NewWSReplayer takes ownership of every WebSocket session in the cassette.
 func NewWSReplayer(c *cassette.Cassette) *wsReplayer {
-	r := &wsReplayer{}
+	r := &wsReplayer{cursor: map[string]int{}}
 	for _, it := range c.Interactions {
 		if it.Type == "websocket" && it.WebSocket != nil {
 			r.sessions = append(r.sessions, it.WebSocket)
@@ -209,6 +210,9 @@ func NewWSReplayer(c *cassette.Cassette) *wsReplayer {
 	return r
 }
 
+// Remaining reports the number of recorded WS sessions. Replay is cyclic and
+// never removes sessions (so a workload can be replayed repeatedly), hence this
+// is the total session count, not a count-down.
 func (r *wsReplayer) Remaining() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -216,51 +220,97 @@ func (r *wsReplayer) Remaining() int {
 }
 
 // HasForPath reports whether takeForPath would return a session for host/path
-// (without consuming it). Used by the auto handler to decide replay vs record.
+// (without advancing the cursor). Used by the auto handler to decide replay vs
+// record.
 func (r *wsReplayer) HasForPath(host, path string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.indexForPath(host, path) >= 0
+	return len(r.candidatesForPath(host, path)) > 0
 }
 
-// indexForPath returns the index of the next session to serve for host/path, or
-// -1. Sessions are matched by request path first (FIFO within a path); a
-// path-less recorded session matches any path as a back-compat fallback.
-// Matching by path — not by global order — is what lets concurrent connections
-// to different endpoints (e.g. /v1/realtime and /v1/audio/diarize during audio
-// processing) each get their own recording instead of deadlocking on a swapped
-// session.
+// candidatesForPath returns the recorded sessions servable for host/path, in
+// recorded order. Sessions are matched by request path first; when no session
+// was recorded for that exact path, path-less recorded sessions match as a
+// back-compat fallback. Matching by path — not by global order — is what lets
+// concurrent connections to different endpoints (e.g. /v1/realtime and
+// /v1/audio/diarize during audio processing) each get their own recording
+// instead of deadlocking on a swapped session.
 //
 // host narrows matching in forward-proxy mode where one cassette may hold
 // sessions for several destinations. A non-empty live host only matches a
 // recorded session whose host is the same or empty (legacy/reverse recordings),
 // so reverse-mode behavior (host == "") is unchanged. Caller must hold r.mu.
-func (r *wsReplayer) indexForPath(host, path string) int {
-	fallback := -1
-	for i, s := range r.sessions {
+func (r *wsReplayer) candidatesForPath(host, path string) []*cassette.WSSession {
+	var exact, fallback []*cassette.WSSession
+	for _, s := range r.sessions {
 		if host != "" && s.Request.Host != "" && s.Request.Host != host {
 			continue
 		}
-		if s.Request.Path == path {
-			return i
+		switch {
+		case s.Request.Path == path:
+			exact = append(exact, s)
+		case s.Request.Path == "":
+			fallback = append(fallback, s)
 		}
-		if fallback < 0 && s.Request.Path == "" {
-			fallback = i
-		}
+	}
+	if len(exact) > 0 {
+		return exact
 	}
 	return fallback
 }
 
-func (r *wsReplayer) takeForPath(host, path string) *cassette.WSSession {
+// takeForPath returns the next session for host/path, advancing a per-key
+// cursor that wraps modulo the candidate count. Within one run, repeated
+// connections to a path with N recorded sessions walk them in recorded order;
+// the cursor wraps rather than exhausting, so the same WS workload replayed
+// again against the same running buffr starts a fresh cycle and matches
+// identically — idempotent across runs, the same property the HTTP matcher has.
+//
+// Tie-breaker: a WebSocket handshake carries no request body, so when a path
+// has more than one recorded session the query string is the closest analogue
+// of HTTP's body-aware match key for telling otherwise-identical paths apart
+// (e.g. wss://…/v1/realtime?model=A vs ?model=B). When the live query uniquely
+// narrows the path's sessions, that subset is served; when it matches none
+// (e.g. it carries per-run noise), matching falls back to path-only cycling so
+// it is never stricter than before — at worst the recorded-order tie-break the
+// deterministic-suite contract already relies on. Frame content is deliberately
+// not used: a recorded session may open with a server→client frame (OpenAI
+// realtime greets with session.created), so buffering a first client frame to
+// match on would deadlock those sessions.
+func (r *wsReplayer) takeForPath(host, path, query string) *cassette.WSSession {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	i := r.indexForPath(host, path)
-	if i < 0 {
+	pathCands := r.candidatesForPath(host, path)
+	if len(pathCands) == 0 {
 		return nil
 	}
-	s := r.sessions[i]
-	r.sessions = append(r.sessions[:i], r.sessions[i+1:]...)
+	cands, key := pathCands, host+"\x00"+path
+	if len(pathCands) > 1 {
+		if q := filterByQuery(pathCands, query); len(q) > 0 {
+			cands, key = q, host+"\x00"+path+"\x00"+query
+		}
+	}
+	s := cands[r.cursor[key]%len(cands)]
+	r.cursor[key]++
 	return s
+}
+
+// filterByQuery returns the sessions whose recorded handshake query equals the
+// live one, in recorded order. An empty result means the live query matched no
+// recorded session and the caller should fall back to path-only matching.
+//
+// TODO(#1): the query is compared exactly, not run through IgnoreRule like HTTP
+// bodies/paths. Fine while realtime handshakes carry only a stable ?model=…, but
+// per-run noise (workspace_id, session token, timestamp) would break it. Extend
+// IgnoreRule.In to accept request.query and normalize here before comparing.
+func filterByQuery(sessions []*cassette.WSSession, query string) []*cassette.WSSession {
+	var out []*cassette.WSSession
+	for _, s := range sessions {
+		if s.Request.Query == query {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // ReplayWSHandler returns a Handler that serves the next recorded session per
@@ -269,7 +319,7 @@ func (r *wsReplayer) takeForPath(host, path string) *cassette.WSSession {
 func ReplayWSHandler(rep *wsReplayer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		session := rep.takeForPath(matchHost(r), r.URL.Path)
+		session := rep.takeForPath(matchHost(r), r.URL.Path, r.URL.RawQuery)
 		if session == nil {
 			slog.Warn("WS "+r.URL.Path, "src", "miss")
 			http.Error(w, "buffr: no cassette ws session for "+r.URL.Path, 599)
