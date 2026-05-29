@@ -472,6 +472,118 @@ func TestWebSocketRecordReplay(t *testing.T) {
 	exchange(dialWS(repURL))
 }
 
+// Plain-HTTP (absolute-form, non-CONNECT) forward requests are recorded and
+// replayed just like the HTTPS path. Egress to a non-TLS upstream is remapped by
+// host:80 → 127.0.0.1:port.
+func TestPlainHTTPRecordReplay(t *testing.T) {
+	var hits int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_, _ = w.Write([]byte("plain:" + r.URL.Path))
+	}))
+	defer upstream.Close()
+
+	ca := newCA(t)
+	data := t.TempDir()
+	setEgress(t, map[string]string{"api.test:80": hostPort(upstream.URL)})
+
+	recURL := startForward(t, Config{Mode: "auto", DataDir: data, CA: ca})
+	rc := mitmClient(t, recURL, ca)
+	status, body := getBody(t, rc, "http://api.test/v1/ping")
+	if status != 200 || body != "plain:/v1/ping" {
+		t.Fatalf("record: status=%d body=%q", status, body)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("record should hit upstream once, got %d", got)
+	}
+
+	upstream.Close()
+	repURL := startForward(t, Config{Mode: "replay", DataDir: data, CA: ca})
+	pc := mitmClient(t, repURL, ca)
+	status, body2 := getBody(t, pc, "http://api.test/v1/ping")
+	if status != 200 || body2 != body {
+		t.Fatalf("replay: status=%d body=%q (want cassette hit)", status, body2)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("replay must not egress; upstream hits = %d, want 1", got)
+	}
+}
+
+// A bypassed plain-HTTP request is passed straight through (no recording). Uses
+// 127.0.0.1 so passthroughHTTP's DefaultTransport can dial it without DNS.
+func TestPlainHTTPBypass(t *testing.T) {
+	var hits int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_, _ = w.Write([]byte("direct-http"))
+	}))
+	defer upstream.Close()
+
+	ca := newCA(t)
+	data := t.TempDir()
+	proxyURL := startForward(t, Config{Mode: "auto", DataDir: data, CA: ca, Bypass: []string{"127.0.0.1"}})
+	client := mitmClient(t, proxyURL, ca)
+
+	status, body := getBody(t, client, upstream.URL) // http://127.0.0.1:PORT
+	if status != 200 || body != "direct-http" {
+		t.Fatalf("bypass: status=%d body=%q", status, body)
+	}
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("bypass should reach upstream directly, hits=%d", hits)
+	}
+	if entries, _ := filepath.Glob(filepath.Join(data, "*.json")); len(entries) != 0 {
+		t.Fatalf("bypassed plain HTTP must not write a cassette, found %v", entries)
+	}
+}
+
+func TestIsBypassed(t *testing.T) {
+	f := New(Config{CA: newCA(t), Bypass: []string{"qdrant", ".internal", "127.0.0.1"}})
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{"qdrant", true},              // exact
+		{"x.qdrant", true},            // subdomain of a bypass entry
+		{"a.b.internal", true},        // subdomain, leading dot trimmed
+		{"internal", true},            // exact after dot-trim
+		{"qdrant.example.com", false}, // suffix elsewhere — not a subdomain match
+		{"notqdrant", false},          // substring, not a label boundary
+		{"127.0.0.1", true},
+		{"api.huggingface.co", false},
+	}
+	for _, tc := range tests {
+		if got := f.isBypassed(tc.host); got != tc.want {
+			t.Errorf("isBypassed(%q) = %v, want %v", tc.host, got, tc.want)
+		}
+	}
+}
+
+func TestResolveHost(t *testing.T) {
+	data := "/cassettes"
+	hf := HostConfig{Host: "huggingface.co", Cassette: "/data/hf.json"}
+	star := HostConfig{Host: "*", Cassette: "/data/misc.json"}
+
+	t.Run("exact match wins", func(t *testing.T) {
+		f := New(Config{CA: newCA(t), DataDir: data, Hosts: []HostConfig{hf, star}})
+		if got := f.resolveHost("huggingface.co"); got.Cassette != "/data/hf.json" {
+			t.Errorf("exact match cassette = %q", got.Cassette)
+		}
+	})
+	t.Run("falls back to star", func(t *testing.T) {
+		f := New(Config{CA: newCA(t), DataDir: data, Hosts: []HostConfig{hf, star}})
+		if got := f.resolveHost("unlisted.example.com"); got.Cassette != "/data/misc.json" {
+			t.Errorf("star fallback cassette = %q", got.Cassette)
+		}
+	})
+	t.Run("no star → synthesized per-host default", func(t *testing.T) {
+		f := New(Config{CA: newCA(t), DataDir: data, Hosts: []HostConfig{hf}})
+		got := f.resolveHost("other.example.com")
+		if got.Host != "other.example.com" || got.Cassette != filepath.Join(data, "other.example.com.json") {
+			t.Errorf("synthesized default = %+v", got)
+		}
+	})
+}
+
 // Criterion 8 (CA lifecycle) is covered by package mitm's tests (chain verify,
 // persistence). Every test in this file additionally confirms a freshly trusted
 // client completes a real MITM'd TLS handshake against the proxy with no

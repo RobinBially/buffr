@@ -107,3 +107,43 @@ func TestTLSConfigServesPerSNILeaf(t *testing.T) {
 		t.Errorf("ALPN should advertise only http/1.1, got %v", cfg.NextProtos)
 	}
 }
+
+func TestLeafForIPLiteral(t *testing.T) {
+	ca, _, _ := newCA(t)
+	leaf, err := ca.LeafFor("127.0.0.1")
+	if err != nil {
+		t.Fatalf("LeafFor: %v", err)
+	}
+	// An IP literal must land in IPAddresses, not DNSNames, or the client's
+	// address verification fails.
+	if len(leaf.Leaf.IPAddresses) != 1 || leaf.Leaf.IPAddresses[0].String() != "127.0.0.1" {
+		t.Errorf("IP literal should be in IPAddresses, got %v (DNSNames %v)",
+			leaf.Leaf.IPAddresses, leaf.Leaf.DNSNames)
+	}
+	if len(leaf.Leaf.DNSNames) != 0 {
+		t.Errorf("IP literal must not be stored as a DNS name, got %v", leaf.Leaf.DNSNames)
+	}
+
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(ca.CertPEM())
+	if _, err := leaf.Leaf.Verify(x509.VerifyOptions{
+		DNSName: "127.0.0.1", // the verifier treats an IP literal here as an IP-SAN check
+		Roots:   roots,
+	}); err != nil {
+		t.Fatalf("IP-literal leaf failed to verify: %v", err)
+	}
+}
+
+func TestTLSConfigSNILessFallback(t *testing.T) {
+	ca, _, _ := newCA(t)
+	cfg := ca.TLSConfig()
+	// No SNI (empty ServerName): the handshake must still complete with a
+	// placeholder leaf rather than erroring.
+	cert, err := cfg.GetCertificate(&tls.ClientHelloInfo{ServerName: ""})
+	if err != nil {
+		t.Fatalf("GetCertificate with empty SNI: %v", err)
+	}
+	if cert.Leaf.Subject.CommonName != "unknown" {
+		t.Errorf("SNI-less leaf CN = %q, want unknown", cert.Leaf.Subject.CommonName)
+	}
+}
