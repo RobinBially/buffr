@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 	"sync"
@@ -276,7 +277,10 @@ func findCapture(caps []cassette.Capture, pattern string) string {
 	return ""
 }
 
-func (m *Matcher) signature(method, host, path, body string) string {
+// normalizeRequest applies the ignore-rule rewrites then the normalizer,
+// returning the canonical (path, body) a request hashes to. Factored out of
+// signature so Diagnose can compare normalized bodies without rehashing.
+func (m *Matcher) normalizeRequest(method, path, body string) (string, string) {
 	for _, r := range m.rules {
 		switch r.In {
 		case IgnoreInBody:
@@ -285,7 +289,11 @@ func (m *Matcher) signature(method, host, path, body string) string {
 			path = r.Pattern.ReplaceAllString(path, r.ReplaceWith)
 		}
 	}
-	normalized := m.normalizer(method, path, body)
+	return path, m.normalizer(method, path, body)
+}
+
+func (m *Matcher) signature(method, host, path, body string) string {
+	npath, normalized := m.normalizeRequest(method, path, body)
 	h := sha256.New()
 	h.Write([]byte(method))
 	h.Write([]byte{0})
@@ -296,10 +304,80 @@ func (m *Matcher) signature(method, host, path, body string) string {
 		h.Write([]byte(host))
 		h.Write([]byte{0})
 	}
-	h.Write([]byte(path))
+	h.Write([]byte(npath))
 	h.Write([]byte{0})
 	h.Write([]byte(normalized))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// Diagnose explains why a live request found no match. It locates the recorded
+// request on the same method+host+path whose normalized body shares the longest
+// common prefix with the live one, then reports the first byte where they
+// diverge with surrounding context. Returns a short note when no same-route
+// recording exists at all (a genuinely new endpoint). Intended purely for the
+// miss-path log line — 100% replay hit rate is a hard requirement, and a single
+// drifted token poisons every downstream turn, so the exact divergence is what
+// an operator needs to fix the source (or add an ignore rule).
+func (m *Matcher) Diagnose(method, host, path, body string) string {
+	_, liveNorm := m.normalizeRequest(method, path, body)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var bestNorm string
+	bestPrefix := -1
+	candidates := 0
+	for _, g := range m.groups {
+		for _, ex := range g.entries {
+			rq := ex.Request
+			if rq.Method != method || rq.Path != path || rq.Host != host {
+				continue
+			}
+			candidates++
+			_, recNorm := m.normalizeRequest(rq.Method, rq.Path, rq.Body)
+			if p := commonPrefixLen(liveNorm, recNorm); p > bestPrefix {
+				bestPrefix, bestNorm = p, recNorm
+			}
+		}
+	}
+	if candidates == 0 {
+		return "no recorded request on this route (new endpoint/path)"
+	}
+	return formatDivergence(liveNorm, bestNorm, bestPrefix)
+}
+
+func commonPrefixLen(a, b string) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return n
+}
+
+// formatDivergence renders the first point where live and recorded normalized
+// bodies differ, with a window of context on each side, so the offending token
+// is obvious in the log.
+func formatDivergence(live, rec string, at int) string {
+	const ctx = 70
+	if at == len(live) && at == len(rec) {
+		return "normalized bodies identical — divergence is in method/host/path"
+	}
+	lo := at - ctx
+	if lo < 0 {
+		lo = 0
+	}
+	window := func(s string) string {
+		hi := at + ctx
+		if hi > len(s) {
+			hi = len(s)
+		}
+		return s[lo:hi]
+	}
+	return fmt.Sprintf("closest match diverges at byte %d (live len=%d, recorded len=%d):\n  live: …%q…\n  rec : …%q…",
+		at, len(live), len(rec), window(live), window(rec))
 }
 
 // ExactBodyNormalizer hashes the request body verbatim. This is the safest

@@ -2,10 +2,33 @@ package matcher
 
 import (
 	"regexp"
+	"strings"
 	"testing"
 
 	"buffr/internal/cassette"
 )
+
+func TestDiagnosePinpointsDivergence(t *testing.T) {
+	c := &cassette.Cassette{Interactions: []cassette.Interaction{
+		ex("POST", "/v1/chat", `{"q":"alpha","n":1}`, 200),
+	}}
+	m := New(c, nil)
+	// same route, body diverges at the value of "q"
+	d := m.Diagnose("POST", "", "/v1/chat", `{"q":"beta","n":1}`)
+	if !strings.Contains(d, "diverges at byte") {
+		t.Fatalf("expected divergence report, got %q", d)
+	}
+}
+
+func TestDiagnoseNewRoute(t *testing.T) {
+	c := &cassette.Cassette{Interactions: []cassette.Interaction{
+		ex("POST", "/v1/chat", `{"q":"alpha"}`, 200),
+	}}
+	m := New(c, nil)
+	if d := m.Diagnose("POST", "", "/v1/other", `{}`); !strings.Contains(d, "new endpoint") {
+		t.Fatalf("expected new-route note, got %q", d)
+	}
+}
 
 func ex(method, path, body string, status int) cassette.Interaction {
 	return cassette.Interaction{

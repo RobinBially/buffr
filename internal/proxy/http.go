@@ -366,7 +366,8 @@ func ReplayHandler(m *matcher.Matcher) http.Handler {
 
 		ex := m.Take(r.Method, matchHost(r), r.URL.Path, string(body))
 		if ex == nil {
-			slog.Warn(r.Method+" "+r.URL.Path, "src", "miss")
+			slog.Warn(r.Method+" "+r.URL.Path, "src", "miss",
+				"diff", m.Diagnose(r.Method, matchHost(r), r.URL.Path, string(body)))
 			http.Error(w, fmt.Sprintf("buffr: no cassette match for %s %s", r.Method, r.URL.Path), 599)
 			return
 		}
