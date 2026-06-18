@@ -132,6 +132,31 @@ func TestDistinctHostsDoNotCollide(t *testing.T) {
 	}
 }
 
+func TestQueryStringKeysSeparately(t *testing.T) {
+	// Two GETs to the same path differing only by query string (Google News
+	// /rss/search?q=…) must key separately, not collapse onto one entry.
+	mk := func(query string, status int) cassette.Interaction {
+		it := exHost("GET", "news.google.com", "/rss/search", "", status)
+		it.HTTP.Request.Query = query
+		return it
+	}
+	c := &cassette.Cassette{Interactions: []cassette.Interaction{
+		mk("q=SAP", 200),
+		mk("q=Google", 201),
+	}}
+	m := New(c, nil)
+	if got := m.Take("GET", "news.google.com", "/rss/search?q=Google", ""); got == nil || got.Response.Status != 201 {
+		t.Fatalf("want Google entry (201), got %+v", got)
+	}
+	if got := m.Take("GET", "news.google.com", "/rss/search?q=SAP", ""); got == nil || got.Response.Status != 200 {
+		t.Fatalf("want SAP entry (200), got %+v", got)
+	}
+	// An unrecorded query must miss, not fall back to another query's entry.
+	if got := m.Take("GET", "news.google.com", "/rss/search?q=Anthropic", ""); got != nil {
+		t.Fatalf("unrecorded query must not match, got %+v", got)
+	}
+}
+
 func TestNoMatch(t *testing.T) {
 	c := &cassette.Cassette{Interactions: []cassette.Interaction{
 		ex("POST", "/a", "body-a", 200),

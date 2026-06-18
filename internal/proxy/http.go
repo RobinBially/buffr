@@ -152,7 +152,7 @@ func AutoHandler(target *url.URL, rec *Recorder, m *matcher.Matcher) http.Handle
 		}
 		r.Body.Close()
 
-		ex := m.Take(r.Method, matchHost(r), r.URL.Path, string(body))
+		ex := m.Take(r.Method, matchHost(r), matcher.PathWithQuery(r.URL.Path, r.URL.RawQuery), string(body))
 		if ex == nil {
 			// Cache miss — RecordHandler logs this as src=upstream.
 			r.Body = io.NopCloser(bytes.NewReader(body))
@@ -364,7 +364,7 @@ func ReplayHandler(m *matcher.Matcher) http.Handler {
 		}
 		r.Body.Close()
 
-		ex := m.Take(r.Method, matchHost(r), r.URL.Path, string(body))
+		ex := m.Take(r.Method, matchHost(r), matcher.PathWithQuery(r.URL.Path, r.URL.RawQuery), string(body))
 		if ex == nil {
 			slog.Warn(r.Method+" "+r.URL.Path, "src", "miss",
 				"diff", m.Diagnose(r.Method, matchHost(r), r.URL.Path, string(body)))

@@ -147,10 +147,22 @@ func (m *Matcher) Add(ex *cassette.HTTPExchange) {
 	m.mu.Unlock()
 }
 
+// PathWithQuery joins a URL path and raw query into the single string used for
+// match signatures, so a GET whose only distinguishing input is its query string
+// (e.g. Google News RSS /rss/search?q=…) keys per-query instead of collapsing
+// every query onto one cassette entry. Empty query → bare path, keeping
+// signatures of query-less routes (and pre-existing cassettes) byte-identical.
+func PathWithQuery(path, query string) string {
+	if query == "" {
+		return path
+	}
+	return path + "?" + query
+}
+
 // add buckets an exchange under its match key. Caller holds the lock (or is the
 // single-threaded New constructor).
 func (m *Matcher) add(ex *cassette.HTTPExchange) {
-	sig := m.signature(ex.Request.Method, ex.Request.Host, ex.Request.Path, ex.Request.Body)
+	sig := m.signature(ex.Request.Method, ex.Request.Host, PathWithQuery(ex.Request.Path, ex.Request.Query), ex.Request.Body)
 	g := m.groups[sig]
 	if g == nil {
 		g = &group{}
