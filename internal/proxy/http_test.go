@@ -352,3 +352,39 @@ func TestReplayMissReturns599(t *testing.T) {
 		t.Errorf("expected 599 on cassette miss, got %d", resp.StatusCode)
 	}
 }
+
+func TestRecordSSETruncatedUpstreamIsNotCommitted(t *testing.T) {
+	// Upstream dies mid-stream: the proxy client must see a broken body (not a
+	// clean end-of-stream), and the truncated exchange must NOT be recorded —
+	// otherwise the cut gets baked into the cassette and replays as if it were
+	// genuine upstream behaviour.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		f := w.(http.Flusher)
+		_, _ = w.Write([]byte("data: one\n\n"))
+		f.Flush()
+		panic(http.ErrAbortHandler) // simulates upstream connection cut
+	}))
+	defer upstream.Close()
+
+	target, _ := url.Parse(upstream.URL)
+	path := filepath.Join(t.TempDir(), "cass.json")
+	rec := NewRecorder(path)
+	proxy := httptest.NewServer(RecordHandler(target, rec))
+	defer proxy.Close()
+
+	resp, err := http.Get(proxy.URL + "/v1/stream")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if _, readErr := io.ReadAll(resp.Body); readErr == nil {
+		t.Errorf("truncated upstream stream was served as a clean end-of-stream")
+	}
+
+	loaded, err := cassette.Load(path)
+	if err == nil && len(loaded.Interactions) != 0 {
+		t.Errorf("truncated SSE exchange was committed to the cassette: %d interaction(s)", len(loaded.Interactions))
+	}
+}

@@ -272,6 +272,7 @@ func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 		}
 
 		isSSE := isEventStream(resp.Header)
+		var streamErr error
 		if isSSE {
 			copyHeadersExceptHopByHop(w.Header(), resp.Header)
 			w.WriteHeader(resp.StatusCode)
@@ -283,6 +284,7 @@ func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 				if n > 0 {
 					chunk := append([]byte(nil), buf[:n]...)
 					if _, werr := w.Write(chunk); werr != nil {
+						streamErr = fmt.Errorf("client write: %w", werr)
 						break
 					}
 					if flusher != nil {
@@ -298,9 +300,25 @@ func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 					lastChunkAt = now
 				}
 				if readErr != nil {
+					if readErr != io.EOF {
+						streamErr = fmt.Errorf("upstream read: %w", readErr)
+					}
 					break
 				}
 			}
+		}
+		if streamErr != nil {
+			// A stream that didn't end cleanly is an error, not a result. Committing
+			// it would bake the truncation into the cassette, where it replays
+			// deterministically and masquerades as genuine upstream behaviour.
+			// Discard the partial recording and abort the client response mid-body
+			// (no terminating chunk) so the caller sees the breakage too.
+			slog.Error(r.Method+" "+r.URL.Path,
+				"err", streamErr,
+				"src", "upstream",
+				"chunks_discarded", len(recordedResp.BodyChunks),
+				"msg", "SSE stream truncated — recording discarded")
+			panic(http.ErrAbortHandler)
 		}
 
 		var fullBody []byte
