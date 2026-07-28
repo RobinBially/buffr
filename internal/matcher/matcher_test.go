@@ -1,6 +1,7 @@
 package matcher
 
 import (
+	"encoding/json"
 	"regexp"
 	"strings"
 	"testing"
@@ -331,5 +332,37 @@ func TestSkipsNonHTTP(t *testing.T) {
 	m := New(c, nil)
 	if m.Remaining() != 1 {
 		t.Errorf("ws interaction must not be in HTTP pool; got remaining=%d", m.Remaining())
+	}
+}
+
+// Binary request bodies (e.g. multipart file uploads) must survive the
+// cassette JSON round-trip and still match a live request presenting the same
+// raw bytes. Storing them as a plain JSON string U+FFFD-corrupts them, so they
+// take the BodyB64 path — and the matcher must hash the DECODED bytes.
+func TestBinaryRequestBodySurvivesJSONRoundTripAndMatches(t *testing.T) {
+	raw := []byte("--boundary\r\nContent-Disposition: form-data\r\n\r\n\x89PNG\x00\xff\xfe\x01binary\xf0zip\r\n--boundary--\r\n")
+	plain, b64 := cassette.EncodeBody(raw)
+	if plain != "" || b64 == "" {
+		t.Fatalf("invalid-UTF8 body must take the b64 path, got plain=%q b64=%q", plain, b64)
+	}
+	c := &cassette.Cassette{Interactions: []cassette.Interaction{{
+		Type: "http",
+		HTTP: &cassette.HTTPExchange{
+			Request:  cassette.HTTPRequest{Method: "POST", Path: "/forms/libreoffice/convert", Body: plain, BodyB64: b64},
+			Response: cassette.HTTPResponse{Status: 200, Body: "%PDF-fake"},
+		},
+	}}}
+	// JSON round-trip = what Save/Load do to a cassette on disk
+	data, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var loaded cassette.Cassette
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		t.Fatal(err)
+	}
+	m := New(&loaded, nil)
+	if got := m.Take("POST", "", "/forms/libreoffice/convert", string(raw)); got == nil {
+		t.Fatal("binary request body did not match after JSON round-trip")
 	}
 }

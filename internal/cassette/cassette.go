@@ -89,6 +89,11 @@ type HTTPRequest struct {
 	Query   string              `json:"query,omitempty"`
 	Headers map[string][]string `json:"headers,omitempty"`
 	Body    string              `json:"body,omitempty"`
+	// BodyB64 carries request bodies that aren't valid UTF-8 (e.g. multipart
+	// file uploads). Storing them in Body would U+FFFD-corrupt them on JSON
+	// marshal, and the replay signature (computed from the raw live bytes)
+	// would never match again. Exactly one of Body/BodyB64 is set.
+	BodyB64 string `json:"body_b64,omitempty"`
 }
 
 // HTTPResponse is the full response, including SSE chunking when applicable.

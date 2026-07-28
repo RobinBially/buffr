@@ -162,7 +162,9 @@ func PathWithQuery(path, query string) string {
 // add buckets an exchange under its match key. Caller holds the lock (or is the
 // single-threaded New constructor).
 func (m *Matcher) add(ex *cassette.HTTPExchange) {
-	sig := m.signature(ex.Request.Method, ex.Request.Host, PathWithQuery(ex.Request.Path, ex.Request.Query), ex.Request.Body)
+	// decode through DecodeBody so binary requests (BodyB64) hash from the same
+	// raw bytes a live request presents
+	sig := m.signature(ex.Request.Method, ex.Request.Host, PathWithQuery(ex.Request.Path, ex.Request.Query), string(cassette.DecodeBody(ex.Request.Body, ex.Request.BodyB64)))
 	g := m.groups[sig]
 	if g == nil {
 		g = &group{}
@@ -344,7 +346,7 @@ func (m *Matcher) Diagnose(method, host, path, body string) string {
 				continue
 			}
 			candidates++
-			_, recNorm := m.normalizeRequest(rq.Method, rq.Path, rq.Body)
+			_, recNorm := m.normalizeRequest(rq.Method, rq.Path, string(cassette.DecodeBody(rq.Body, rq.BodyB64)))
 			if p := commonPrefixLen(liveNorm, recNorm); p > bestPrefix {
 				bestPrefix, bestNorm = p, recNorm
 			}

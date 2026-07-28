@@ -319,6 +319,7 @@ func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 			recordedResp.Body, recordedResp.BodyB64 = cassette.EncodeBody(full)
 		}
 
+		reqBody, reqBodyB64 := cassette.EncodeBody(body)
 		exch := &cassette.HTTPExchange{
 			Request: cassette.HTTPRequest{
 				Method:  r.Method,
@@ -326,7 +327,8 @@ func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 				Path:    r.URL.Path,
 				Query:   r.URL.RawQuery,
 				Headers: filterHeaders(r.Header),
-				Body:    string(body),
+				Body:    reqBody,
+				BodyB64: reqBodyB64,
 			},
 			Response: recordedResp,
 		}
