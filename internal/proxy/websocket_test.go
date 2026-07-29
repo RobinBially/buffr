@@ -311,6 +311,101 @@ func TestReplayWSSamePathSameQueryKeepsOrder(t *testing.T) {
 	}
 }
 
+// TestReplayWSNarrowsSamePathByLeadingClientFrames guards the TTS case: several
+// sessions share host, path, query *and* their first client frame (a
+// session.config that carries no per-test info); only the second client frame —
+// the text to synthesize — tells them apart. Recorded order can't decide, since
+// parallel test workers connect in arbitrary order.
+func TestReplayWSNarrowsSamePathByLeadingClientFrames(t *testing.T) {
+	config := cassette.WSFrame{
+		Direction: cassette.DirClientToServer,
+		Opcode:    cassette.OpText,
+		Data:      `{"type":"session.config","voice":"heidi"}`,
+	}
+	session := func(text, audio string) cassette.Interaction {
+		return cassette.Interaction{Type: "websocket", WebSocket: &cassette.WSSession{
+			Request: cassette.WSRequest{Path: "/v1/audio/speech/stream", Query: "model=VoxCPM2"},
+			Frames: []cassette.WSFrame{
+				config,
+				{Direction: cassette.DirClientToServer, Opcode: cassette.OpText, Data: text},
+				{Direction: cassette.DirServerToClient, Opcode: cassette.OpText, Data: audio},
+			},
+		}}
+	}
+	c := &cassette.Cassette{Interactions: []cassette.Interaction{
+		session("short", "audio-short"),
+		session("a much longer sentence", "audio-long"),
+	}}
+	rep := NewWSReplayer(c)
+	srv := httptest.NewServer(ReplayWSHandler(rep))
+	defer srv.Close()
+
+	synthesize := func(text string) string {
+		conn, _, err := websocket.DefaultDialer.Dial(
+			wsURL(srv.URL)+"/v1/audio/speech/stream?model=VoxCPM2", nil)
+		if err != nil {
+			t.Fatalf("dial %q: %v", text, err)
+		}
+		defer conn.Close()
+		for _, frame := range []string{config.Data, text} {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(frame)); err != nil {
+				t.Fatalf("write %q: %v", text, err)
+			}
+		}
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read %q: %v", text, err)
+		}
+		return string(msg)
+	}
+
+	for run := 1; run <= 3; run++ {
+		// Ask for the second recording first — arrival order must not decide.
+		if got := synthesize("a much longer sentence"); got != "audio-long" {
+			t.Fatalf("run %d long: got %q, want audio-long", run, got)
+		}
+		if got := synthesize("short"); got != "audio-short" {
+			t.Fatalf("run %d short: got %q, want audio-short", run, got)
+		}
+	}
+}
+
+// TestReplayWSNarrowingDriftClosesConnection covers the other exit of frame
+// narrowing: a client frame that matches none of the still-ambiguous candidates
+// is drift, not a session pick, and must close the connection loudly. Drift hits
+// on the *second* frame here — after narrowing already accepted the shared first
+// one — so only the narrowing path can reach it.
+func TestReplayWSNarrowingDriftClosesConnection(t *testing.T) {
+	session := func(text string) cassette.Interaction {
+		return cassette.Interaction{Type: "websocket", WebSocket: &cassette.WSSession{
+			Request: cassette.WSRequest{Path: "/stream"},
+			Frames: []cassette.WSFrame{
+				{Direction: cassette.DirClientToServer, Opcode: cassette.OpText, Data: "config"},
+				{Direction: cassette.DirClientToServer, Opcode: cassette.OpText, Data: text},
+				{Direction: cassette.DirServerToClient, Opcode: cassette.OpText, Data: "ok"},
+			},
+		}}
+	}
+	c := &cassette.Cassette{Interactions: []cassette.Interaction{session("a"), session("b")}}
+	rep := NewWSReplayer(c)
+	srv := httptest.NewServer(ReplayWSHandler(rep))
+	defer srv.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL)+"/stream", nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	for _, frame := range []string{"config", "c"} {
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(frame)); err != nil {
+			t.Fatalf("write %q: %v", frame, err)
+		}
+	}
+	if _, _, err = conn.ReadMessage(); err == nil {
+		t.Fatalf("expected connection close on cassette drift, got no error")
+	}
+}
+
 func TestReplayWSMissReturns599(t *testing.T) {
 	rep := NewWSReplayer(&cassette.Cassette{})
 	srv := httptest.NewServer(ReplayWSHandler(rep))

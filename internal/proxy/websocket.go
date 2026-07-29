@@ -184,10 +184,9 @@ func RecordWSHandler(target *url.URL, rec *Recorder) http.Handler {
 	})
 }
 
-// ReplayWSHandler serves a WebSocket session from the cassette. It uses the
-// next un-consumed websocket interaction (sessions are matched by order of
-// appearance, not by request shape — the upgrade request rarely contains
-// stable per-test info worth matching on).
+// ReplayWSHandler serves a WebSocket session from the cassette, matched by
+// host+path, then query, then leading client frames; recorded order only breaks
+// ties between candidates that are indistinguishable by all three.
 //
 // Strict mode: every client-to-server frame must match the recorded frame
 // at the corresponding position. On drift, the proxy closes the connection
@@ -259,12 +258,13 @@ func (r *wsReplayer) candidatesForPath(host, path string) []*cassette.WSSession 
 	return fallback
 }
 
-// takeForPath returns the next session for host/path, advancing a per-key
-// cursor that wraps modulo the candidate count. Within one run, repeated
-// connections to a path with N recorded sessions walk them in recorded order;
-// the cursor wraps rather than exhausting, so the same WS workload replayed
-// again against the same running buffr starts a fresh cycle and matches
-// identically — idempotent across runs, the same property the HTTP matcher has.
+// takeForPath returns the sessions servable for host/path in the order the
+// connection should prefer them, advancing a per-key cursor that rotates the
+// list. Within one run, repeated connections to a path with N recorded sessions
+// walk them in recorded order; the cursor wraps rather than exhausting, so the
+// same WS workload replayed again against the same running buffr starts a fresh
+// cycle and matches identically — idempotent across runs, the same property the
+// HTTP matcher has.
 //
 // Tie-breaker: a WebSocket handshake carries no request body, so when a path
 // has more than one recorded session the query string is the closest analogue
@@ -272,12 +272,10 @@ func (r *wsReplayer) candidatesForPath(host, path string) []*cassette.WSSession 
 // (e.g. wss://…/v1/realtime?model=A vs ?model=B). When the live query uniquely
 // narrows the path's sessions, that subset is served; when it matches none
 // (e.g. it carries per-run noise), matching falls back to path-only cycling so
-// it is never stricter than before — at worst the recorded-order tie-break the
-// deterministic-suite contract already relies on. Frame content is deliberately
-// not used: a recorded session may open with a server→client frame (OpenAI
-// realtime greets with session.created), so buffering a first client frame to
-// match on would deadlock those sessions.
-func (r *wsReplayer) takeForPath(host, path, query string) *cassette.WSSession {
+// it is never stricter than before. Anything still ambiguous after that is left
+// to the caller to narrow by leading client frames (see narrowByClientFrames),
+// with this rotation as the final tie-break among content-equal candidates.
+func (r *wsReplayer) takeForPath(host, path, query string) []*cassette.WSSession {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	pathCands := r.candidatesForPath(host, path)
@@ -290,9 +288,11 @@ func (r *wsReplayer) takeForPath(host, path, query string) *cassette.WSSession {
 			cands, key = q, host+"\x00"+path+"\x00"+query
 		}
 	}
-	s := cands[r.cursor[key]%len(cands)]
+	offset := r.cursor[key] % len(cands)
 	r.cursor[key]++
-	return s
+	rotated := make([]*cassette.WSSession, 0, len(cands))
+	rotated = append(rotated, cands[offset:]...)
+	return append(rotated, cands[:offset]...)
 }
 
 // filterByQuery returns the sessions whose recorded handshake query equals the
@@ -313,14 +313,52 @@ func filterByQuery(sessions []*cassette.WSSession, query string) []*cassette.WSS
 	return out
 }
 
+// narrowByClientFrames picks one session out of several that path+query could
+// not tell apart, by reading the connection's leading client frames: while the
+// next expected frame is client_to_server in *every* remaining candidate, read
+// it and keep only the candidates it matches; as soon as one candidate is due a
+// server frame (or only one candidate is left) commit to the first survivor.
+// Reading is safe exactly under that condition — the recordings themselves say
+// the client speaks next, so no session that opens with a server frame (OpenAI
+// realtime greets with session.created) is ever waited on.
+//
+// Returns the chosen session and how many of its frames the narrowing already
+// consumed. A zero survivor count means the client's frames match no recording:
+// genuine drift, reported against the first candidate for a useful diff.
+func narrowByClientFrames(conn *websocket.Conn, cands []*cassette.WSSession) (*cassette.WSSession, int, error) {
+	cursor := 0
+	for len(cands) > 1 {
+		for _, s := range cands {
+			if cursor >= len(s.Frames) || s.Frames[cursor].Direction != cassette.DirClientToServer {
+				return cands[0], cursor, nil
+			}
+		}
+		msgType, payload, err := conn.ReadMessage()
+		if err != nil {
+			return cands[0], cursor, nil // let the replay loop report the early close
+		}
+		var kept []*cassette.WSSession
+		for _, s := range cands {
+			if validateFrame(s.Frames[cursor], msgType, payload) == nil {
+				kept = append(kept, s)
+			}
+		}
+		if len(kept) == 0 {
+			return cands[0], cursor, validateFrame(cands[0].Frames[cursor], msgType, payload)
+		}
+		cands, cursor = kept, cursor+1
+	}
+	return cands[0], cursor, nil
+}
+
 // ReplayWSHandler returns a Handler that serves the next recorded session per
 // WebSocket connection. If the cassette has no more WS sessions, the upgrade
 // is rejected with a 599 — same convention as the HTTP replay miss.
 func ReplayWSHandler(rep *wsReplayer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		session := rep.takeForPath(matchHost(r), r.URL.Path, r.URL.RawQuery)
-		if session == nil {
+		cands := rep.takeForPath(matchHost(r), r.URL.Path, r.URL.RawQuery)
+		if len(cands) == 0 {
 			slog.Warn("WS "+r.URL.Path, "src", "miss")
 			http.Error(w, "buffr: no cassette ws session for "+r.URL.Path, 599)
 			return
@@ -331,6 +369,17 @@ func ReplayWSHandler(rep *wsReplayer) http.Handler {
 		}
 		defer conn.Close()
 
+		session, cursor, err := narrowByClientFrames(conn, cands)
+		if err != nil {
+			slog.Warn("WS cassette drift", "path", r.URL.Path, "frame", cursor, "err", err)
+			_ = conn.WriteControl(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(1011, "buffr: cassette drift"),
+				time.Now().Add(time.Second),
+			)
+			return
+		}
+
 		// Two passes over the frames in order: server-to-client are written
 		// to the client (honoring delay), client-to-server are read and
 		// validated. When the next recorded frame is c→s, block on reading
@@ -339,7 +388,6 @@ func ReplayWSHandler(rep *wsReplayer) http.Handler {
 			"frames", len(session.Frames),
 			"dur", fmtDur(time.Since(start)),
 			"src", "cassette")
-		cursor := 0
 		for cursor < len(session.Frames) {
 			f := session.Frames[cursor]
 			switch f.Direction {
