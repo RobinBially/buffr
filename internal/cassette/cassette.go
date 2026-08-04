@@ -73,9 +73,9 @@ type Capture struct {
 //
 // Headers are kept lowercase keys → values list (HTTP headers are
 // case-insensitive). Body holds the raw request body as a string. Hop-by-hop
-// and proxy-sensitive headers (Host, Connection, Authorization values) are
-// recorded as the client sent them so replay can verify drift, but matching
-// ignores them by default.
+// headers are dropped, and credential-bearing ones (Authorization, Cookie, any
+// *-api-key/token/secret) keep their name but get a redacted value — cassettes
+// are committed artifacts. Matching ignores headers either way.
 //
 // Host is populated only in forward-proxy (MITM) mode, where a single cassette
 // may hold traffic for several destination hosts; it becomes part of the match

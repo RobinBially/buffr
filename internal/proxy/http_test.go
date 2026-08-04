@@ -65,6 +65,56 @@ func TestRecordPlainHTTP(t *testing.T) {
 	}
 }
 
+func TestRecordRedactsCredentialHeadersButStillSendsThemUpstream(t *testing.T) {
+	var upstreamGot http.Header
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamGot = r.Header.Clone()
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer upstream.Close()
+
+	target, _ := url.Parse(upstream.URL)
+	path := filepath.Join(t.TempDir(), "cass.json")
+	rec := NewRecorder(path)
+	proxy := httptest.NewServer(RecordHandler(target, rec))
+	defer proxy.Close()
+
+	req, _ := http.NewRequest("POST", proxy.URL+"/v1/chat", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer sk-live-secret")
+	req.Header.Set("X-Goog-Api-Key", "goog-secret")
+	req.Header.Set("Xi-Api-Key", "eleven-secret")
+	req.Header.Set("Cookie", "session=secret")
+	req.Header.Set("X-Request-Id", "keep-me")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := upstreamGot.Get("Authorization"); got != "Bearer sk-live-secret" {
+		t.Errorf("upstream must still get the real credential; got %q", got)
+	}
+
+	loaded, err := cassette.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	headers := loaded.Interactions[0].HTTP.Request.Headers
+	for _, name := range []string{"Authorization", "X-Goog-Api-Key", "Xi-Api-Key", "Cookie"} {
+		vs, ok := headers[name]
+		if !ok {
+			t.Errorf("%s should stay present so credential drift is visible", name)
+			continue
+		}
+		if len(vs) != 1 || vs[0] != RedactedHeaderValue {
+			t.Errorf("%s not redacted: %q", name, vs)
+		}
+	}
+	if got := headers["X-Request-Id"]; len(got) != 1 || got[0] != "keep-me" {
+		t.Errorf("harmless header must survive verbatim: %q", got)
+	}
+}
+
 func TestRecordSSE(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

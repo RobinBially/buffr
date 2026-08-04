@@ -344,7 +344,7 @@ func RecordHandler(target *url.URL, rec *Recorder) http.Handler {
 				Host:    matchHost(r),
 				Path:    r.URL.Path,
 				Query:   r.URL.RawQuery,
-				Headers: filterHeaders(r.Header),
+				Headers: filterRequestHeaders(r.Header),
 				Body:    reqBody,
 				BodyB64: reqBodyB64,
 			},
@@ -430,10 +430,7 @@ func trimSpaces(s string) string {
 	return s[start:end]
 }
 
-// hopByHop is the canonical list from RFC 7230 §6.1. We also strip Host and
-// Authorization so cassettes don't carry secrets back to disk by default — a
-// real production-grade tool might want a redaction pipeline; for an MVP
-// dropping them is acceptable since matching ignores headers anyway.
+// hopByHop is the canonical list from RFC 7230 §6.1.
 var hopByHop = map[string]struct{}{
 	"Connection":          {},
 	"Keep-Alive":          {},
@@ -465,6 +462,54 @@ func filterHeaders(src http.Header) map[string][]string {
 		out[k] = append([]string(nil), vs...)
 	}
 	return out
+}
+
+// RedactedHeaderValue replaces a credential a cassette must not carry. The
+// header name survives so drift in *which* credentials a client sends is still
+// visible in the diff.
+const RedactedHeaderValue = "[REDACTED]"
+
+var sensitiveHeaders = map[string]struct{}{
+	"Authorization":       {},
+	"Proxy-Authorization": {},
+	"Cookie":              {},
+}
+
+// Every provider invents its own key header (X-Api-Key, Xi-Api-Key,
+// X-Goog-Api-Key, X-Amz-Security-Token …), so match the name's shape instead of
+// chasing a list that is wrong the moment someone adds an upstream.
+var sensitiveHeaderFragments = []string{"api-key", "apikey", "token", "secret", "password", "credential"}
+
+// filterRequestHeaders is filterHeaders for the record path: cassettes get
+// committed, so credentials must never reach disk. Matching never looks at
+// headers (the matcher's only ignore targets are request.body and request.path),
+// and replay sends the *live* request upstream, so a placeholder costs nothing.
+func filterRequestHeaders(src http.Header) map[string][]string {
+	out := filterHeaders(src)
+	for k, vs := range out {
+		if !isSensitiveHeader(k) {
+			continue
+		}
+		redacted := make([]string, len(vs))
+		for i := range redacted {
+			redacted[i] = RedactedHeaderValue
+		}
+		out[k] = redacted
+	}
+	return out
+}
+
+func isSensitiveHeader(name string) bool {
+	if _, ok := sensitiveHeaders[http.CanonicalHeaderKey(name)]; ok {
+		return true
+	}
+	lower := strings.ToLower(name)
+	for _, fragment := range sensitiveHeaderFragments {
+		if strings.Contains(lower, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 // singleJoin joins two URL paths preserving exactly one '/' between them.

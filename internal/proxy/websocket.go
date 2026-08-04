@@ -93,7 +93,7 @@ func RecordWSHandler(target *url.URL, rec *Recorder) http.Handler {
 				Path:    r.URL.Path,
 				Host:    matchHost(r),
 				Query:   r.URL.RawQuery,
-				Headers: filterHeaders(r.Header),
+				Headers: filterRequestHeaders(r.Header),
 			},
 		}
 		var (

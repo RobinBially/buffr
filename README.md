@@ -157,6 +157,8 @@ BUFFR_PROXY: |
 
 Cassettes are plain JSON — readable in diffs, editable by hand.
 
+Credential-bearing request headers never reach disk: `Authorization`, `Proxy-Authorization`, `Cookie` and any header whose name contains `api-key`, `apikey`, `token`, `secret`, `password` or `credential` are recorded with their name intact and their value replaced by `[REDACTED]`. The live request still carries the real credential upstream, and matching never looks at headers — so a cassette stays safe to commit.
+
 ## Configuration
 
 All flags have environment variable equivalents; flags take precedence.
