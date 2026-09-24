@@ -2,12 +2,12 @@
 # Release buffr: checks, tag, and the multi-arch image build on GitHub Actions.
 #
 # Usage:
- #   VERSION=0.8.10 ./scripts/release.sh [--dry-run] [--publish] [--force]
+#   VERSION=0.8.10 ./scripts/release.sh [--dry-run] [--publish] [--force]
 #
 # Without --publish only the checks run. --publish pushes the commit and the tag
 # and waits for the docker.yml run that builds and pushes
- # ghcr.io/robinbially/buffr for linux/amd64 and linux/arm64. --force continues
- # although the working tree is dirty.
+# ghcr.io/robinbially/buffr for linux/amd64 and linux/arm64. --force continues
+# although the working tree is dirty.
 #
 # A local image build is deliberately not part of this script: a multi-arch
 # build needs buildx and QEMU, which the CI runner provides.
@@ -19,6 +19,12 @@
 #   WORKFLOW            default docker.yml
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) sed -n '2,19p' "$0" | sed 's/^# *//'; exit 0 ;;
+    esac
+done
 
 VERSION="${VERSION:?VERSION must be set (x.y.z)}"
 RELEASE_REPOSITORY="${RELEASE_REPOSITORY:-RobinBially/buffr}"
@@ -35,7 +41,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run) dry_run=1; shift ;;
         --publish) publish=1; shift ;;
         --force) force=1; shift ;;
-        -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,19p' "$0" | sed 's/^# *//'; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
