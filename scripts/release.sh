@@ -6,7 +6,7 @@
 #
 # Without --publish only the checks run. --publish pushes the commit and the tag
 # and waits for the docker.yml run that builds and pushes
-# ghcr.io/localfoundry/buffr for linux/amd64 and linux/arm64. --force continues
+# ghcr.io/robin-bially/buffr for linux/amd64 and linux/arm64. --force continues
 # although the working tree is dirty.
 #
 # A local image build is deliberately not part of this script: a multi-arch
@@ -14,8 +14,8 @@
 #
 # Environment:
 #   VERSION             required, x.y.z
-#   RELEASE_REPOSITORY  default localfoundry/buffr
-#   IMAGE               default ghcr.io/localfoundry/buffr
+#   RELEASE_REPOSITORY  default robin-bially/buffr
+#   IMAGE               default ghcr.io/robin-bially/buffr
 #   WORKFLOW            default docker.yml
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -27,8 +27,8 @@ for arg in "$@"; do
 done
 
 VERSION="${VERSION:?VERSION must be set (x.y.z)}"
-RELEASE_REPOSITORY="${RELEASE_REPOSITORY:-localfoundry/buffr}"
-IMAGE="${IMAGE:-ghcr.io/localfoundry/buffr}"
+RELEASE_REPOSITORY="${RELEASE_REPOSITORY:-robin-bially/buffr}"
+IMAGE="${IMAGE:-ghcr.io/robin-bially/buffr}"
 WORKFLOW="${WORKFLOW:-docker.yml}"
 
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "VERSION must be x.y.z, got: $VERSION" >&2; exit 1; }
