@@ -14,7 +14,7 @@
 #
 # Environment:
 #   VERSION             required, x.y.z
-#   RELEASE_REPOSITORY  default RobinBially/buffr
+#   RELEASE_REPOSITORY  default localfoundry/buffr
 #   IMAGE               default ghcr.io/robinbially/buffr
 #   WORKFLOW            default docker.yml
 set -euo pipefail
@@ -27,7 +27,7 @@ for arg in "$@"; do
 done
 
 VERSION="${VERSION:?VERSION must be set (x.y.z)}"
-RELEASE_REPOSITORY="${RELEASE_REPOSITORY:-RobinBially/buffr}"
+RELEASE_REPOSITORY="${RELEASE_REPOSITORY:-localfoundry/buffr}"
 IMAGE="${IMAGE:-ghcr.io/robinbially/buffr}"
 WORKFLOW="${WORKFLOW:-docker.yml}"
 

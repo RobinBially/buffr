@@ -19,7 +19,7 @@ instant, free and deterministic.
 
 <br /><br />
 
-[![Release](https://img.shields.io/github/v/release/RobinBially/buffr?style=flat-square&label=latest)](https://github.com/RobinBially/buffr/releases/latest)
+[![Release](https://img.shields.io/github/v/release/localfoundry/buffr?style=flat-square&label=latest)](https://github.com/localfoundry/buffr/releases/latest)
 
 </div>
 
