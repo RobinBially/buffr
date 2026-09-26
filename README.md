@@ -58,7 +58,7 @@ docker run \
   -e BUFFR_TARGET=https://api.openai.com \
   -v ./cassettes:/data \
   -p 8080:8080 \
-  ghcr.io/robinbially/buffr:latest
+  ghcr.io/localfoundry/buffr:latest
 ```
 
 <details>
@@ -80,7 +80,7 @@ docker run \
   ' \
   -v ./cassettes:/data \
   -p 8081:8081 -p 8082:8082 -p 8083:8083 \
-  ghcr.io/robinbially/buffr:latest
+  ghcr.io/localfoundry/buffr:latest
 ```
 
 </details>
@@ -254,7 +254,7 @@ go run ./cmd/buffr auto --target https://api.openai.com
 VERSION=0.8.10 ./scripts/release.sh --publish
 ```
 
-The script runs the checks (`go test ./...`, `go build ./...`), pushes the commit and the tag, and waits for `docker.yml`, which builds and pushes `ghcr.io/robinbially/buffr` for `linux/amd64` and `linux/arm64`. Without `--publish` only the checks run; `--dry-run` checks the prerequisites and `--force` tolerates a dirty tree. The multi-arch build runs in CI on purpose: locally it would need buildx and QEMU.
+The script runs the checks (`go test ./...`, `go build ./...`), pushes the commit and the tag, and waits for `docker.yml`, which builds and pushes `ghcr.io/localfoundry/buffr` for `linux/amd64` and `linux/arm64`. Without `--publish` only the checks run; `--dry-run` checks the prerequisites and `--force` tolerates a dirty tree. The multi-arch build runs in CI on purpose: locally it would need buildx and QEMU.
 
 ## License
 
